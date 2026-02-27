@@ -347,18 +347,18 @@ pub fn get_transfer_options() -> Result<(usize, bool, bool, String)> {
     println!("{}", "─".repeat(60));
 
     // Number of workers
-    let suggested_workers = std::thread::available_parallelism()
+    let max_workers = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(2, 8);
+        .unwrap_or(2);
+    let suggested_workers = 2usize.min(max_workers);
     let default_workers = suggested_workers.to_string();
-    let workers_prompt = format!("Parallel workers (1-8) [{}]: ", suggested_workers);
+    let workers_prompt = format!("Parallel workers (1-{}) [{}]: ", max_workers, suggested_workers);
     let num_workers = match editor.readline_with_initial(&workers_prompt, (&default_workers, "")) {
         Ok(line) => line
             .trim()
             .parse::<usize>()
             .unwrap_or(suggested_workers)
-            .clamp(1, 8),
+            .clamp(1, max_workers),
         Err(_) => suggested_workers,
     };
 
