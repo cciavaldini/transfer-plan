@@ -173,8 +173,6 @@ pub fn get_transfer_mappings() -> Result<(Vec<TransferMapping>, PathBuf)> {
     let mut mapping_number = 1;
 
     loop {
-        println!("\n{}", format!("Mapping #{}", mapping_number).cyan().bold());
-
         // Get source path with auto-completion, pre-filled with default source
         let source_default = default_source.to_string_lossy().to_string();
         let source = match editor.readline_with_initial("Source path: ", (&source_default, "")) {
@@ -240,6 +238,8 @@ pub fn get_transfer_mappings() -> Result<(Vec<TransferMapping>, PathBuf)> {
                 return Err(e.into());
             }
         };
+
+        println!("\n{}", format!("Mapping #{}", mapping_number).cyan().bold());
 
         // Display source info
         if source.is_file() {
