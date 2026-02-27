@@ -4,10 +4,11 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
+use std::collections::HashSet;
 use std::fs;
-use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,8 @@ const SYNC_ESTIMATE_SPEED_FACTOR: f64 = 0.35;
 const SYNC_ESTIMATE_MAX_FLUSH_SPEED_BPS: f64 = 120.0 * 1_000_000.0;
 const SYNC_ESTIMATE_FALLBACK_SPEED_BPS: f64 = 25.0 * 1_000_000.0;
 const SYNC_ESTIMATE_BASE_OVERHEAD_SECS: f64 = 3.0;
+const SYNC_ESTIMATE_SAFETY_MULTIPLIER: f64 = 1.5;
+const SYNC_MONITOR_INTERVAL_MS: u64 = 300;
 const FILE_PROGRESS_BAR_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 static FILE_PROGRESS_STYLE: Lazy<ProgressStyle> = Lazy::new(|| {
@@ -37,6 +40,11 @@ pub struct TransferOutcome {
     pub files_failed: u64,
 }
 
+struct MonitorOutcome {
+    stopped_by_user: bool,
+    smoothed_speed_bps: f64,
+}
+
 pub struct TransferStats {
     bytes_transferred: AtomicU64,
     files_completed: AtomicU64,
@@ -52,6 +60,7 @@ struct WorkerContext {
     stop_requested: Arc<AtomicBool>,
     stats: Arc<TransferStats>,
     io_bytes: Arc<AtomicU64>,
+    sync_targets: Arc<Mutex<Vec<std::path::PathBuf>>>,
     verify: bool,
     cleanup_mode: Arc<str>,
 }
@@ -107,30 +116,16 @@ fn fallback_sync() {
     }
 }
 
-fn run_post_transfer_sync() -> Duration {
-    let sync_start = Instant::now();
-    match Command::new("sync").status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!(
-                "⚠️  Warning: sync exited with status {}. Falling back to libc::sync().",
-                status
-            );
-            fallback_sync();
-        }
-        Err(e) => {
-            eprintln!(
-                "⚠️  Warning: failed to run sync command ({}). Falling back to libc::sync().",
-                e
-            );
-            fallback_sync();
-        }
+fn estimated_flush_speed_bps(smoothed_speed_bps: f64) -> f64 {
+    if smoothed_speed_bps > 0.0 {
+        (smoothed_speed_bps * SYNC_ESTIMATE_SPEED_FACTOR).min(SYNC_ESTIMATE_MAX_FLUSH_SPEED_BPS)
+    } else {
+        SYNC_ESTIMATE_FALLBACK_SPEED_BPS
     }
-    sync_start.elapsed()
 }
 
 #[cfg(target_os = "linux")]
-fn estimate_pending_sync_secs(smoothed_speed_bps: f64) -> Option<f64> {
+fn pending_writeback_bytes() -> Option<u64> {
     let content = fs::read_to_string("/proc/meminfo").ok()?;
 
     let mut dirty_kb = None;
@@ -148,26 +143,27 @@ fn estimate_pending_sync_secs(smoothed_speed_bps: f64) -> Option<f64> {
         }
     }
 
-    let pending_bytes = (dirty_kb.unwrap_or(0) + writeback_kb.unwrap_or(0)) * 1024;
+    Some((dirty_kb.unwrap_or(0) + writeback_kb.unwrap_or(0)) * 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pending_writeback_bytes() -> Option<u64> {
+    None
+}
+
+fn estimate_pending_sync_secs(smoothed_speed_bps: f64) -> Option<f64> {
+    let pending_bytes = pending_writeback_bytes()?;
     if pending_bytes == 0 {
         return Some(0.0);
     }
 
     // Sync flush throughput is usually lower than copy throughput; keep estimate conservative.
-    let estimated_flush_speed_bps = if smoothed_speed_bps > 0.0 {
-        (smoothed_speed_bps * SYNC_ESTIMATE_SPEED_FACTOR).min(SYNC_ESTIMATE_MAX_FLUSH_SPEED_BPS)
-    } else {
-        SYNC_ESTIMATE_FALLBACK_SPEED_BPS
-    };
+    let estimated_flush_speed_bps = estimated_flush_speed_bps(smoothed_speed_bps);
 
-    let estimated_secs =
-        SYNC_ESTIMATE_BASE_OVERHEAD_SECS + (pending_bytes as f64 / estimated_flush_speed_bps);
+    let estimated_secs = (SYNC_ESTIMATE_BASE_OVERHEAD_SECS
+        + (pending_bytes as f64 / estimated_flush_speed_bps))
+        * SYNC_ESTIMATE_SAFETY_MULTIPLIER;
     Some(estimated_secs.clamp(0.0, MAX_PENDING_SYNC_ESTIMATE_SECS))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn estimate_pending_sync_secs(_smoothed_speed_bps: f64) -> Option<f64> {
-    None
 }
 
 #[inline]
@@ -177,6 +173,189 @@ fn smooth_speed(previous: f64, current_sample: f64) -> f64 {
     } else {
         SPEED_SMOOTHING_ALPHA * current_sample + (1.0 - SPEED_SMOOTHING_ALPHA) * previous
     }
+}
+
+fn push_sync_target(sync_targets: &Arc<Mutex<Vec<std::path::PathBuf>>>, destination: &std::path::Path) {
+    let target = destination
+        .parent()
+        .unwrap_or(destination)
+        .to_path_buf();
+    let mut guard = sync_targets.lock().unwrap_or_else(|e| e.into_inner());
+    guard.push(target);
+}
+
+fn open_sync_handle(path: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut current = Some(path);
+    while let Some(p) = current {
+        match fs::File::open(p) {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                current = p.parent();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("No existing path found for sync target {}", path.display()),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn run_scoped_sync(sync_paths: &[std::path::PathBuf]) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut synced_devices = HashSet::new();
+    let mut synced_any = false;
+    let mut first_error: Option<anyhow::Error> = None;
+
+    for path in sync_paths {
+        let handle = match open_sync_handle(path) {
+            Ok(handle) => handle,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(
+                        "Failed to open sync target {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                continue;
+            }
+        };
+
+        let dev_id = match handle.metadata() {
+            Ok(meta) => meta.dev(),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(
+                        "Failed to read metadata for sync target {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                continue;
+            }
+        };
+
+        if !synced_devices.insert(dev_id) {
+            continue;
+        }
+
+        let rc = unsafe { libc::syncfs(handle.as_raw_fd()) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            if first_error.is_none() {
+                first_error = Some(anyhow::anyhow!(
+                    "syncfs failed for {}: {}",
+                    path.display(),
+                    e
+                ));
+            }
+            continue;
+        }
+
+        synced_any = true;
+    }
+
+    if synced_any {
+        Ok(())
+    } else if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Err(anyhow::anyhow!(
+            "No valid sync target found for scoped sync"
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_scoped_sync(_sync_paths: &[std::path::PathBuf]) -> Result<()> {
+    fallback_sync();
+    Ok(())
+}
+
+fn run_post_transfer_sync(
+    overall_pb: &ProgressBar,
+    sync_paths: &[std::path::PathBuf],
+    flush_speed_hint_bps: f64,
+) -> Duration {
+    let sync_start = Instant::now();
+    let sync_paths = sync_paths.to_vec();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let _ = tx.send(run_scoped_sync(&sync_paths));
+    });
+
+    let mut last_pending = pending_writeback_bytes();
+    let mut last_pending_sample = Instant::now();
+    let mut observed_flush_speed_bps = 0.0;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(SYNC_MONITOR_INTERVAL_MS)) {
+            Ok(result) => {
+                if let Err(e) = result {
+                    eprintln!(
+                        "⚠️  Warning: scoped sync failed ({}). Falling back to libc::sync().",
+                        e
+                    );
+                    fallback_sync();
+                }
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                let pending_now = pending_writeback_bytes();
+
+                if let (Some(prev), Some(current)) = (last_pending, pending_now) {
+                    let dt = now.duration_since(last_pending_sample).as_secs_f64();
+                    if dt > 0.0 {
+                        let drained_bytes = prev.saturating_sub(current) as f64;
+                        if drained_bytes > 0.0 {
+                            let sample_speed = drained_bytes / dt;
+                            observed_flush_speed_bps =
+                                smooth_speed(observed_flush_speed_bps, sample_speed);
+                        }
+                    }
+
+                    last_pending = Some(current);
+                    last_pending_sample = now;
+
+                    let effective_flush_speed_bps = if observed_flush_speed_bps > 0.0 {
+                        observed_flush_speed_bps
+                    } else {
+                        flush_speed_hint_bps
+                    };
+                    let eta_secs = if effective_flush_speed_bps > 0.0 {
+                        (current as f64 / effective_flush_speed_bps).ceil() as u64
+                    } else {
+                        0
+                    };
+                    overall_pb.set_message(format!(
+                        "Finalizing writes (sync)... Remaining: {}",
+                        format_eta(eta_secs)
+                    ));
+                } else {
+                    overall_pb.set_message(format!(
+                        "Finalizing writes (sync)... Elapsed: {}",
+                        format_eta(sync_start.elapsed().as_secs())
+                    ));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "⚠️  Warning: sync monitor channel closed unexpectedly. Falling back to libc::sync()."
+                );
+                fallback_sync();
+                break;
+            }
+        }
+    }
+
+    sync_start.elapsed()
 }
 
 fn finish_successful_transfer(
@@ -277,6 +456,7 @@ fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) {
         stop_requested,
         stats,
         io_bytes,
+        sync_targets,
         verify,
         cleanup_mode,
     } = ctx;
@@ -321,6 +501,8 @@ fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) {
         if show_file_progress {
             file_pb.set_message(format!("{}📄 {}", worker_prefix, file_name));
         }
+
+        push_sync_target(&sync_targets, &item.destination);
 
         // Transfer the file
         match copy_file_optimized(
@@ -374,6 +556,7 @@ pub async fn transfer_worker_pool(
 ) -> Result<TransferOutcome> {
     let stats = Arc::new(TransferStats::new());
     let io_bytes = Arc::new(AtomicU64::new(0));
+    let sync_targets = Arc::new(Mutex::new(Vec::new()));
 
     let overall_pb = multi_progress.add(ProgressBar::new(0));
     overall_pb.set_style(
@@ -395,6 +578,7 @@ pub async fn transfer_worker_pool(
         stop_requested: stop_requested.clone(),
         stats: stats.clone(),
         io_bytes: io_bytes.clone(),
+        sync_targets: sync_targets.clone(),
         verify,
         cleanup_mode: Arc::<str>::from(cleanup_mode),
     };
@@ -502,7 +686,10 @@ pub async fn transfer_worker_pool(
             tokio::time::sleep(Duration::from_millis(MONITOR_INTERVAL_MS)).await;
         }
 
-        stopped_by_user
+        MonitorOutcome {
+            stopped_by_user,
+            smoothed_speed_bps,
+        }
     });
 
     // Wait for all workers to complete
@@ -514,14 +701,22 @@ pub async fn transfer_worker_pool(
 
     // Stop monitor
     let _ = queue.get_sender().send(QueueCommand::Terminate);
-    let stopped_from_monitor = monitor_handle.await?;
+    let monitor_outcome = monitor_handle.await?;
+    let stopped_from_monitor = monitor_outcome.stopped_by_user;
 
     let (completed, failed, transferred_bytes) = stats.get_stats();
     let transfer_elapsed = stats.start_time.elapsed();
+    let sync_paths: Vec<std::path::PathBuf> = {
+        let guard = sync_targets.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
+    };
     let mut sync_duration = Duration::from_secs(0);
     if completed + failed > 0 {
-        overall_pb.set_message("Finalizing writes (sync)...");
-        sync_duration = run_post_transfer_sync();
+        sync_duration = run_post_transfer_sync(
+            &overall_pb,
+            &sync_paths,
+            estimated_flush_speed_bps(monitor_outcome.smoothed_speed_bps),
+        );
     }
 
     // Explicit total = transfer duration + post-transfer sync duration.
