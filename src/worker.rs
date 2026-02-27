@@ -1,7 +1,7 @@
 use crate::queue::{QueueCommand, TransferQueue};
 use crate::transfer::{copy_file_optimized, format_size};
 use anyhow::{Context, Result};
-use colored::*;
+use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::fs;
@@ -256,7 +256,7 @@ fn remove_empty_source_directories(
 }
 
 /// Single worker that processes files from the queue
-fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<()> {
+fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) {
     let WorkerContext {
         queue,
         multi_progress,
@@ -274,14 +274,11 @@ fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<()> {
         }
 
         // Get next item
-        let item = match queue.recv_timeout(Duration::from_millis(QUEUE_POLL_INTERVAL_MS)) {
-            Some(item) => item,
-            None => {
-                if queue.is_empty() || stop_requested.load(Ordering::Relaxed) {
-                    break;
-                }
-                continue;
+        let Some(item) = queue.recv_timeout(Duration::from_millis(QUEUE_POLL_INTERVAL_MS)) else {
+            if queue.is_empty() || stop_requested.load(Ordering::Relaxed) {
+                break;
             }
+            continue;
         };
 
         let show_file_progress = item.size >= FILE_PROGRESS_BAR_THRESHOLD;
@@ -351,8 +348,6 @@ fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 /// Main transfer worker pool with parallel processing
@@ -491,9 +486,8 @@ pub async fn transfer_worker_pool(
 
     // Wait for all workers to complete
     for handle in handles {
-        match handle.join() {
-            Ok(result) => result?,
-            Err(_) => anyhow::bail!("A transfer worker thread panicked"),
+        if handle.join().is_err() {
+            anyhow::bail!("A transfer worker thread panicked");
         }
     }
 
