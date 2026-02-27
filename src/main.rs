@@ -488,12 +488,23 @@ async fn main() -> Result<()> {
         save_queue_checkpoint(queue.as_ref(), &mut last_saved_revision)?;
 
         if outcome.stopped_by_user || stop_requested.load(Ordering::Relaxed) {
-            println!(
-                "\n{} {} succeeded, {} failed in this batch.",
-                "Transfer interrupted:".yellow().bold(),
-                outcome.files_completed,
-                outcome.files_failed
-            );
+            let pending_items = queue.len();
+            if pending_items > 0 {
+                println!(
+                    "\n{} {} succeeded, {} failed in this batch ({} item(s) still queued).",
+                    "Transfer interrupted:".yellow().bold(),
+                    outcome.files_completed,
+                    outcome.files_failed,
+                    pending_items
+                );
+            } else {
+                println!(
+                    "\n{} {} succeeded, {} failed in this batch.",
+                    "Batch complete (stop requested at end):".yellow().bold(),
+                    outcome.files_completed,
+                    outcome.files_failed
+                );
+            }
             break;
         }
 
@@ -527,12 +538,21 @@ async fn main() -> Result<()> {
     }
 
     if stop_requested.load(Ordering::Relaxed) {
-        println!(
-            "\n{}",
-            "Stopped by user. Pending queue saved to pending_queue.json."
-                .yellow()
-                .bold()
-        );
+        if queue.is_empty() {
+            println!(
+                "\n{}",
+                "Stopped by user. No pending items left in queue."
+                    .yellow()
+                    .bold()
+            );
+        } else {
+            println!(
+                "\n{}",
+                "Stopped by user. Pending queue saved to pending_queue.json."
+                    .yellow()
+                    .bold()
+            );
+        }
         return Ok(());
     }
 
