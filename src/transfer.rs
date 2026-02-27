@@ -10,8 +10,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::task;
+use std::time::{Duration, Instant};
 
 // Optimized buffer sizes based on file size
 const SMALL_BUFFER: usize = 64 * 1024; // 64KB for files < 1MB
@@ -25,6 +24,10 @@ const COPY_FILE_RANGE_CHUNK_SIZE: usize = 128 * 1024 * 1024; // 128MB chunks for
 
 // Verification size limit: don't hash files larger than 10MB
 const VERIFICATION_SIZE_LIMIT: u64 = 10 * 1024 * 1024; // 10MB
+
+// Progress update throttling to reduce UI overhead on small files.
+const PROGRESS_UPDATE_BYTES: u64 = 256 * 1024;
+const PROGRESS_UPDATE_INTERVAL_MS: u64 = 120;
 
 const MAX_RETRIES: usize = 3;
 const RETRY_BASE_DELAY_MS: u64 = 1000;
@@ -108,28 +111,52 @@ struct ProgressReader<R> {
     progress: ProgressBar,
     overall_progress: ProgressBar,
     copied_bytes: Arc<AtomicU64>,
+    pending_bytes: u64,
+    last_flush: Instant,
+}
+
+impl<R> ProgressReader<R> {
+    fn flush_pending(&mut self) {
+        if self.pending_bytes == 0 {
+            return;
+        }
+
+        let bytes = self.pending_bytes;
+        self.pending_bytes = 0;
+        self.last_flush = Instant::now();
+        self.copied_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.progress.inc(bytes);
+        self.overall_progress.inc(bytes);
+    }
 }
 
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        if n > 0 {
-            let bytes = n as u64;
-            self.copied_bytes.fetch_add(bytes, Ordering::Relaxed);
-            self.progress.inc(bytes);
-            self.overall_progress.inc(bytes);
+        if n == 0 {
+            self.flush_pending();
+            return Ok(0);
         }
+
+        self.pending_bytes += n as u64;
+        if self.pending_bytes >= PROGRESS_UPDATE_BYTES
+            || self.last_flush.elapsed() >= Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS)
+        {
+            self.flush_pending();
+        }
+
         Ok(n)
     }
 }
 
 /// Copy file using io::copy with progress tracking (for small files)
-async fn copy_file_iocopy(
+fn copy_file_iocopy(
     source: &Path,
     destination: &Path,
     progress: ProgressBar,
     copied_bytes: Arc<AtomicU64>,
     overall_progress: ProgressBar,
+    file_size: u64,
 ) -> Result<()> {
     // Create parent directories if needed
     if let Some(parent) = destination.parent() {
@@ -137,46 +164,39 @@ async fn copy_file_iocopy(
             .with_context(|| format!("Failed to create directory {:?}", parent))?;
     }
 
-    let source = source.to_path_buf();
-    let destination = destination.to_path_buf();
+    let buffer_size = optimal_buffer_size(file_size);
+    let reader =
+        File::open(source).with_context(|| format!("Failed to open source file {:?}", source))?;
+    let mut reader = ProgressReader {
+        inner: io::BufReader::with_capacity(buffer_size, reader),
+        progress: progress.clone(),
+        overall_progress: overall_progress.clone(),
+        copied_bytes: copied_bytes.clone(),
+        pending_bytes: 0,
+        last_flush: Instant::now(),
+    };
 
-    // Use blocking task for file I/O
-    task::spawn_blocking(move || -> Result<()> {
-        let file_size = fs::metadata(&source)?.len();
-        let buffer_size = optimal_buffer_size(file_size);
+    let writer = File::create(destination)
+        .with_context(|| format!("Failed to create destination file {:?}", destination))?;
+    let mut writer = io::BufWriter::with_capacity(buffer_size, writer);
 
-        let reader = File::open(&source)
-            .with_context(|| format!("Failed to open source file {:?}", source))?;
-        let mut reader = ProgressReader {
-            inner: io::BufReader::with_capacity(buffer_size, reader),
-            progress: progress.clone(),
-            overall_progress: overall_progress.clone(),
-            copied_bytes: copied_bytes.clone(),
-        };
+    // Use kernel-optimized copy
+    io::copy(&mut reader, &mut writer)?;
+    reader.flush_pending();
+    writer.flush()?;
 
-        let writer = File::create(&destination)
-            .with_context(|| format!("Failed to create destination file {:?}", destination))?;
-        let mut writer = io::BufWriter::with_capacity(buffer_size, writer);
-
-        // Use kernel-optimized copy
-        io::copy(&mut reader, &mut writer)?;
-        writer.flush()?;
-
-        finish_with_overall_sync(&progress, &overall_progress, &copied_bytes);
-        Ok(())
-    })
-    .await??;
-
+    finish_with_overall_sync(&progress, &overall_progress, &copied_bytes);
     Ok(())
 }
 
 /// Copy file using copy_file_range() for kernel-assisted transfers (for large files)
-async fn copy_file_copy_file_range(
+fn copy_file_copy_file_range(
     source: &Path,
     destination: &Path,
     progress: ProgressBar,
     copied_bytes: Arc<AtomicU64>,
     overall_progress: ProgressBar,
+    file_size: u64,
 ) -> Result<()> {
     // Create parent directories if needed
     if let Some(parent) = destination.parent() {
@@ -184,64 +204,53 @@ async fn copy_file_copy_file_range(
             .with_context(|| format!("Failed to create directory {:?}", parent))?;
     }
 
-    let source = source.to_path_buf();
-    let destination = destination.to_path_buf();
+    let src_file =
+        File::open(source).with_context(|| format!("Failed to open source file {:?}", source))?;
+    let dst_file = File::create(destination)
+        .with_context(|| format!("Failed to create destination file {:?}", destination))?;
 
-    // Use blocking task for file I/O
-    task::spawn_blocking(move || -> Result<()> {
-        let src_file = File::open(&source)
-            .with_context(|| format!("Failed to open source file {:?}", source))?;
-        let dst_file = File::create(&destination)
-            .with_context(|| format!("Failed to create destination file {:?}", destination))?;
+    let mut offset: libc::off_t = 0;
+    let mut remaining: u64 = file_size;
 
-        let file_size = src_file.metadata()?.len();
+    while remaining > 0 {
+        let chunk_size = std::cmp::min(remaining, COPY_FILE_RANGE_CHUNK_SIZE as u64) as usize;
 
-        let mut offset: libc::off_t = 0;
-        let mut remaining: u64 = file_size;
-
-        while remaining > 0 {
-            let chunk_size = std::cmp::min(remaining, COPY_FILE_RANGE_CHUNK_SIZE as u64) as usize;
-
-            match copy_file_range(&src_file, Some(&mut offset), &dst_file, None, chunk_size) {
-                Ok(bytes_sent) => {
-                    if bytes_sent == 0 {
-                        // EOF reached unexpectedly
-                        anyhow::bail!("Unexpected EOF: {} bytes remaining", remaining);
-                    }
-                    let bytes = bytes_sent as u64;
-                    remaining -= bytes;
-                    copied_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    progress.inc(bytes);
-                    overall_progress.inc(bytes);
+        match copy_file_range(&src_file, Some(&mut offset), &dst_file, None, chunk_size) {
+            Ok(bytes_sent) => {
+                if bytes_sent == 0 {
+                    // EOF reached unexpectedly
+                    anyhow::bail!("Unexpected EOF: {} bytes remaining", remaining);
                 }
-                Err(Errno::EINVAL) | Err(Errno::ENOSYS) | Err(Errno::EXDEV) => {
-                    // Filesystem/kernel doesn't support copy_file_range, fall back to io::copy
-                    progress.set_message("⚠️ copy_file_range not supported, using fallback");
-                    rollback_file_attempt_progress(&progress, &copied_bytes, &overall_progress);
-                    drop(src_file);
-                    drop(dst_file);
+                let bytes = bytes_sent as u64;
+                remaining -= bytes;
+                copied_bytes.fetch_add(bytes, Ordering::Relaxed);
+                progress.inc(bytes);
+                overall_progress.inc(bytes);
+            }
+            Err(Errno::EINVAL) | Err(Errno::ENOSYS) | Err(Errno::EXDEV) => {
+                // Filesystem/kernel doesn't support copy_file_range, fall back to io::copy
+                progress.set_message("⚠️ copy_file_range not supported, using fallback");
+                rollback_file_attempt_progress(&progress, &copied_bytes, &overall_progress);
+                drop(src_file);
+                drop(dst_file);
 
-                    // Remove partial file
-                    let _ = fs::remove_file(&destination);
+                // Remove partial file
+                let _ = fs::remove_file(destination);
 
-                    // Fall back to io::copy
-                    return Err(anyhow::anyhow!(
-                        "copy_file_range not supported, need fallback"
-                    ));
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("copy_file_range error: {}", e));
-                }
+                // Fall back to io::copy
+                return Err(anyhow::anyhow!(
+                    "copy_file_range not supported, need fallback"
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("copy_file_range error: {}", e));
             }
         }
+    }
 
-        // Ensure data is written
-        drop(dst_file);
-        finish_with_overall_sync(&progress, &overall_progress, &copied_bytes);
-        Ok(())
-    })
-    .await??;
-
+    // Ensure data is written
+    drop(dst_file);
+    finish_with_overall_sync(&progress, &overall_progress, &copied_bytes);
     Ok(())
 }
 
@@ -273,37 +282,27 @@ fn hash_file(path: &Path, file_size: u64) -> Result<Vec<u8>> {
 }
 
 /// Verify transfer by comparing hashes (only for files <= 10MB)
-async fn verify_transfer(source: &Path, dest: &Path, file_size: u64) -> Result<bool> {
+fn verify_transfer(source: &Path, dest: &Path, file_size: u64) -> Result<bool> {
     if file_size > VERIFICATION_SIZE_LIMIT {
         // Skip verification for large files
         return Ok(true);
     }
 
-    let source = source.to_path_buf();
-    let dest = dest.to_path_buf();
-
-    task::spawn_blocking(move || -> Result<bool> {
-        let source_hash = hash_file(&source, file_size)?;
-        let dest_hash = hash_file(&dest, file_size)?;
-        Ok(source_hash == dest_hash)
-    })
-    .await?
+    let source_hash = hash_file(source, file_size)?;
+    let dest_hash = hash_file(dest, file_size)?;
+    Ok(source_hash == dest_hash)
 }
 
 /// Copy file with retry logic and verification (HYBRID APPROACH - Option 3)
-pub async fn copy_file_optimized(
+pub fn copy_file_optimized(
     source: &Path,
     destination: &Path,
+    file_size: u64,
     progress: ProgressBar,
     verify: bool,
     copied_bytes: Arc<AtomicU64>,
     overall_progress: ProgressBar,
 ) -> Result<()> {
-    // Get file size once
-    let file_size = fs::metadata(source)
-        .with_context(|| format!("Failed to get file size for {:?}", source))?
-        .len();
-
     // Check if file is too large for verification
     let can_verify = verify && file_size <= VERIFICATION_SIZE_LIMIT;
 
@@ -331,9 +330,8 @@ pub async fn copy_file_optimized(
                 progress.clone(),
                 copied_bytes.clone(),
                 overall_progress.clone(),
-            )
-            .await
-            {
+                file_size,
+            ) {
                 Ok(_) => Ok(()),
                 Err(e) if e.to_string().contains("copy_file_range not supported") => {
                     // Fall back to io::copy for this file
@@ -344,8 +342,8 @@ pub async fn copy_file_optimized(
                         progress.clone(),
                         copied_bytes.clone(),
                         overall_progress.clone(),
+                        file_size,
                     )
-                    .await
                 }
                 Err(e) => Err(e),
             }
@@ -357,15 +355,15 @@ pub async fn copy_file_optimized(
                 progress.clone(),
                 copied_bytes.clone(),
                 overall_progress.clone(),
+                file_size,
             )
-            .await
         };
 
         match copy_result {
             Ok(_) => {
                 // Verify if requested and file is small enough
                 if can_verify {
-                    match verify_transfer(source, destination, file_size).await {
+                    match verify_transfer(source, destination, file_size) {
                         Ok(true) => return Ok(()),
                         Ok(false) => {
                             rollback_file_attempt_progress(
@@ -417,7 +415,7 @@ pub async fn copy_file_optimized(
         if attempt <= MAX_RETRIES {
             // Exponential backoff
             let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * (1 << (attempt - 1)));
-            tokio::time::sleep(delay).await;
+            std::thread::sleep(delay);
             progress.reset();
         }
     }

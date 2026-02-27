@@ -253,7 +253,10 @@ fn detect_busy_processes(mount_point: &Path) -> std::result::Result<Vec<BusyProc
                     return Err(if stderr.is_empty() {
                         format!("Mount is busy (PIDs: {}), but ps failed.", pid_list)
                     } else {
-                        format!("Mount is busy (PIDs: {}), but ps failed: {}", pid_list, stderr)
+                        format!(
+                            "Mount is busy (PIDs: {}), but ps failed: {}",
+                            pid_list, stderr
+                        )
                     });
                 }
                 Err(e) => {
@@ -277,16 +280,20 @@ fn detect_busy_processes(mount_point: &Path) -> std::result::Result<Vec<BusyProc
             }
             Ok(processes)
         }
-        Some(1) => {
-            Ok(vec![])
-        }
+        Some(1) => Ok(vec![]),
         _ => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !stderr.is_empty() {
-                Err(format!("Could not inspect busy processes with fuser: {}", stderr))
+                Err(format!(
+                    "Could not inspect busy processes with fuser: {}",
+                    stderr
+                ))
             } else if !stdout.is_empty() {
-                Err(format!("Could not inspect busy processes with fuser: {}", stdout))
+                Err(format!(
+                    "Could not inspect busy processes with fuser: {}",
+                    stdout
+                ))
             } else {
                 Err(format!(
                     "Could not inspect busy processes with fuser: {}",
@@ -376,7 +383,10 @@ fn close_busy_processes(processes: &[BusyProcess]) {
                         std::thread::sleep(Duration::from_millis(500));
                     }
                     Ok(status) => {
-                        eprintln!("nautilus -q failed (status: {}), killing Nautilus...", status);
+                        eprintln!(
+                            "nautilus -q failed (status: {}), killing Nautilus...",
+                            status
+                        );
                     }
                     Err(e) => {
                         eprintln!("nautilus -q failed ({}), killing Nautilus...", e);

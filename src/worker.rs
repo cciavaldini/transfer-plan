@@ -1,12 +1,14 @@
 use crate::queue::{QueueCommand, TransferQueue};
 use crate::transfer::{copy_file_optimized, format_size};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use once_cell::sync::Lazy;
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const QUEUE_POLL_INTERVAL_MS: u64 = 50;
@@ -14,6 +16,16 @@ const MONITOR_INTERVAL_MS: u64 = 1500;
 const QUEUE_SETTLE_MS: u64 = 500;
 const SPEED_SMOOTHING_ALPHA: f64 = 0.35;
 const MAX_PENDING_SYNC_ESTIMATE_SECS: f64 = 600.0;
+const FILE_PROGRESS_BAR_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+static FILE_PROGRESS_STYLE: Lazy<ProgressStyle> = Lazy::new(|| {
+    ProgressStyle::default_bar()
+        .template(
+            "  {msg} [{bar:30.green/white}] {bytes}/{total_bytes} ({eta}) {binary_bytes_per_sec:.cyan}",
+        )
+        .unwrap()
+        .progress_chars("█▓▒░-")
+});
 
 pub struct TransferOutcome {
     pub stopped_by_user: bool,
@@ -158,6 +170,7 @@ fn finish_successful_transfer(
     file_pb: &ProgressBar,
     worker_prefix: &str,
     file_name: &str,
+    show_feedback: bool,
     cleanup_mode: &str,
     source: &std::path::Path,
     cleanup_root: Option<&std::path::Path>,
@@ -166,28 +179,44 @@ fn finish_successful_transfer(
         "delete" => match fs::remove_file(source) {
             Ok(_) => {
                 remove_empty_source_directories(source, cleanup_root);
-                file_pb.finish_with_message(format!(
-                    "{}✓ {} (removed)",
-                    worker_prefix,
-                    file_name.green()
-                ));
+                if show_feedback {
+                    file_pb.finish_with_message(format!(
+                        "{}✓ {} (removed)",
+                        worker_prefix,
+                        file_name.green()
+                    ));
+                } else {
+                    file_pb.finish();
+                }
             }
             Err(e) => {
-                file_pb.finish_with_message(format!(
-                    "{}✓ {} (transferred, but failed to remove: {})",
-                    worker_prefix,
-                    file_name.yellow(),
-                    e
-                ));
+                if show_feedback {
+                    file_pb.finish_with_message(format!(
+                        "{}✓ {} (transferred, but failed to remove: {})",
+                        worker_prefix,
+                        file_name.yellow(),
+                        e
+                    ));
+                } else {
+                    eprintln!(
+                        "{}⚠ {} transferred, but failed to remove source: {}",
+                        worker_prefix, file_name, e
+                    );
+                    file_pb.finish();
+                }
             }
         },
         _ => {
             // none: leave source intact
-            file_pb.finish_with_message(format!(
-                "{}✓ {} (complete)",
-                worker_prefix,
-                file_name.green()
-            ));
+            if show_feedback {
+                file_pb.finish_with_message(format!(
+                    "{}✓ {} (complete)",
+                    worker_prefix,
+                    file_name.green()
+                ));
+            } else {
+                file_pb.finish();
+            }
         }
     }
 }
@@ -227,7 +256,7 @@ fn remove_empty_source_directories(
 }
 
 /// Single worker that processes files from the queue
-async fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<()> {
+fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<()> {
     let WorkerContext {
         queue,
         multi_progress,
@@ -245,25 +274,26 @@ async fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<
         }
 
         // Get next item
-        let item = match queue.pop() {
+        let item = match queue.recv_timeout(Duration::from_millis(QUEUE_POLL_INTERVAL_MS)) {
             Some(item) => item,
             None => {
                 if queue.is_empty() || stop_requested.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(QUEUE_POLL_INTERVAL_MS)).await;
                 continue;
             }
         };
 
-        // Create progress bar for this file
-        let file_pb = multi_progress.insert_before(&overall_pb, ProgressBar::new(item.size));
-        file_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  {msg} [{bar:30.green/white}] {bytes}/{total_bytes} ({eta}) {binary_bytes_per_sec:.cyan}")
-                .unwrap()
-                .progress_chars("█▓▒░-"),
-        );
+        let show_file_progress = item.size >= FILE_PROGRESS_BAR_THRESHOLD;
+        let file_pb = if show_file_progress {
+            let pb = multi_progress.insert_before(&overall_pb, ProgressBar::new(item.size));
+            pb.set_style(FILE_PROGRESS_STYLE.clone());
+            pb
+        } else {
+            let pb = ProgressBar::hidden();
+            pb.set_length(item.size);
+            pb
+        };
 
         let file_name = item
             .source
@@ -278,19 +308,20 @@ async fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<
             String::new()
         };
 
-        file_pb.set_message(format!("{}📄 {}", worker_prefix, file_name));
+        if show_file_progress {
+            file_pb.set_message(format!("{}📄 {}", worker_prefix, file_name));
+        }
 
         // Transfer the file
         match copy_file_optimized(
             &item.source,
             &item.destination,
+            item.size,
             file_pb.clone(),
             verify,
             io_bytes.clone(),
             overall_pb.clone(),
-        )
-        .await
-        {
+        ) {
             Ok(_) => {
                 stats.add_bytes(item.size);
                 stats.inc_completed();
@@ -298,6 +329,7 @@ async fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<
                     &file_pb,
                     &worker_prefix,
                     &file_name,
+                    show_file_progress,
                     cleanup_mode.as_ref(),
                     &item.source,
                     item.cleanup_root.as_deref(),
@@ -305,12 +337,17 @@ async fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) -> Result<
             }
             Err(e) => {
                 stats.inc_failed();
-                file_pb.finish_with_message(format!(
-                    "{}✗ {} - Error: {}",
-                    worker_prefix,
-                    file_name.red(),
-                    e
-                ));
+                if show_file_progress {
+                    file_pb.finish_with_message(format!(
+                        "{}✗ {} - Error: {}",
+                        worker_prefix,
+                        file_name.red(),
+                        e
+                    ));
+                } else {
+                    eprintln!("{}✗ {} - Error: {}", worker_prefix, file_name, e);
+                    file_pb.finish();
+                }
             }
         }
     }
@@ -354,13 +391,14 @@ pub async fn transfer_worker_pool(
         cleanup_mode: Arc::<str>::from(cleanup_mode),
     };
 
-    // Spawn worker pool
+    // Spawn blocking worker pool threads.
     let mut handles = vec![];
     for worker_id in 0..num_workers {
         let worker_ctx = worker_ctx.clone();
-
-        let handle =
-            tokio::spawn(async move { transfer_worker_single(worker_id, worker_ctx).await });
+        let handle = thread::Builder::new()
+            .name(format!("transfer-worker-{}", worker_id))
+            .spawn(move || transfer_worker_single(worker_id, worker_ctx))
+            .with_context(|| format!("Failed to spawn worker thread {}", worker_id))?;
         handles.push(handle);
     }
 
@@ -421,7 +459,7 @@ pub async fn transfer_worker_pool(
             ));
 
             // Check for commands
-            if let Some(cmd) = queue_clone.try_recv_command().await {
+            if let Some(cmd) = queue_clone.try_recv_command() {
                 match cmd {
                     QueueCommand::Stop => {
                         stopped_by_user = true;
@@ -453,7 +491,10 @@ pub async fn transfer_worker_pool(
 
     // Wait for all workers to complete
     for handle in handles {
-        handle.await??;
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!("A transfer worker thread panicked"),
+        }
     }
 
     // Stop monitor

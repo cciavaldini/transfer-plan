@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
+use crossbeam::channel::{self, Receiver, RecvTimeoutError, Sender};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferItem {
@@ -26,29 +28,61 @@ pub enum QueueCommand {
 }
 
 pub struct TransferQueue {
-    items: Arc<RwLock<VecDeque<TransferItem>>>,
+    items_tx: Sender<TransferItem>,
+    items_rx: Receiver<TransferItem>,
+    snapshot_items: Arc<Mutex<VecDeque<TransferItem>>>,
     total_size: Arc<AtomicU64>,
-    cmd_tx: mpsc::UnboundedSender<QueueCommand>,
-    cmd_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<QueueCommand>>>,
+    pending_items: Arc<AtomicUsize>,
+    revision: Arc<AtomicU64>,
+    cmd_tx: Sender<QueueCommand>,
+    cmd_rx: Receiver<QueueCommand>,
 }
 
 impl TransferQueue {
     pub fn new() -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (items_tx, items_rx) = channel::unbounded();
+        let (cmd_tx, cmd_rx) = channel::unbounded();
         Self {
-            items: Arc::new(RwLock::new(VecDeque::new())),
+            items_tx,
+            items_rx,
+            snapshot_items: Arc::new(Mutex::new(VecDeque::new())),
             total_size: Arc::new(AtomicU64::new(0)),
+            pending_items: Arc::new(AtomicUsize::new(0)),
+            revision: Arc::new(AtomicU64::new(0)),
             cmd_tx,
-            cmd_rx: Arc::new(tokio::sync::Mutex::new(cmd_rx)),
+            cmd_rx,
         }
     }
 
-    pub fn get_sender(&self) -> mpsc::UnboundedSender<QueueCommand> {
+    pub fn get_sender(&self) -> Sender<QueueCommand> {
         self.cmd_tx.clone()
     }
 
-    pub async fn try_recv_command(&self) -> Option<QueueCommand> {
-        self.cmd_rx.lock().await.try_recv().ok()
+    pub fn try_recv_command(&self) -> Option<QueueCommand> {
+        self.cmd_rx.try_recv().ok()
+    }
+
+    fn enqueue_batch(&self, batch: Vec<TransferItem>, batch_size: u64) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut guard = self.snapshot_items.lock();
+            guard.extend(batch.iter().cloned());
+        }
+
+        let batch_len = batch.len();
+        for item in batch {
+            self.items_tx
+                .send(item)
+                .map_err(|_| anyhow::anyhow!("Transfer queue receiver disconnected"))?;
+        }
+
+        self.total_size.fetch_add(batch_size, Ordering::Relaxed);
+        self.pending_items.fetch_add(batch_len, Ordering::Release);
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn add_file(&self, source: PathBuf, dest_root: &Path) -> Result<()> {
@@ -64,22 +98,17 @@ impl TransferQueue {
             size,
             cleanup_root: None,
         };
-
-        // Update total size atomically
-        self.total_size.fetch_add(size, Ordering::Relaxed);
-
-        // Add to queue - no clone needed!
-        self.items.write().unwrap().push_back(item);
-        Ok(())
+        self.enqueue_batch(vec![item], size)
     }
 
     pub fn add_directory(&self, source: &Path, dest_root: &Path) -> Result<()> {
         let dir_name = source.file_name().context("Invalid directory name")?;
         let dest_dir = dest_root.join(dir_name);
 
-        // Batch collection - lock once instead of N times
+        // Batch collection - one queue update for the entire directory.
         let mut batch = Vec::new();
         let mut batch_size = 0u64;
+        let cleanup_root = source.to_path_buf();
 
         for entry in walkdir::WalkDir::new(source) {
             let entry = entry?;
@@ -92,7 +121,7 @@ impl TransferQueue {
                     source: entry.path().to_path_buf(),
                     destination,
                     size,
-                    cleanup_root: Some(source.to_path_buf()),
+                    cleanup_root: Some(cleanup_root.clone()),
                 };
 
                 batch_size += size;
@@ -103,47 +132,72 @@ impl TransferQueue {
         // Keep directory transfers deterministic: alphabetical by source path
         batch.sort_unstable_by(|a, b| a.source.cmp(&b.source));
 
-        // Single lock for entire batch
-        self.total_size.fetch_add(batch_size, Ordering::Relaxed);
-        self.items.write().unwrap().extend(batch);
-
-        Ok(())
+        self.enqueue_batch(batch, batch_size)
     }
 
     /// Snapshot current pending items in queue order.
     pub fn snapshot_items(&self) -> Vec<TransferItem> {
-        self.items.read().unwrap().iter().cloned().collect()
+        self.snapshot_items.lock().iter().cloned().collect()
     }
 
     /// Replace queue content (used to restore an interrupted session).
     pub fn restore_items(&self, items: Vec<TransferItem>) {
+        while self.items_rx.try_recv().is_ok() {}
+
         let total_size = items.iter().map(|item| item.size).sum::<u64>();
-        let mut guard = self.items.write().unwrap();
-        *guard = items.into_iter().collect();
+        let item_count = items.len();
+
+        {
+            let mut guard = self.snapshot_items.lock();
+            *guard = items.iter().cloned().collect();
+        }
+
+        for item in items {
+            if self.items_tx.send(item).is_err() {
+                break;
+            }
+        }
+
         self.total_size.store(total_size, Ordering::Relaxed);
+        self.pending_items.store(item_count, Ordering::Release);
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[inline]
-    pub fn pop(&self) -> Option<TransferItem> {
-        let item = self.items.write().unwrap().pop_front()?;
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<TransferItem> {
+        let item = match self.items_rx.recv_timeout(timeout) {
+            Ok(item) => item,
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return None,
+        };
+
         self.total_size.fetch_sub(item.size, Ordering::Relaxed);
+        self.pending_items.fetch_sub(1, Ordering::AcqRel);
+        self.revision.fetch_add(1, Ordering::Relaxed);
+
+        let mut guard = self.snapshot_items.lock();
+        let _ = guard.pop_front();
+
         Some(item)
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.items.read().unwrap().len()
+        self.pending_items.load(Ordering::Acquire)
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.items.read().unwrap().is_empty()
+        self.len() == 0
     }
 
     #[inline]
     pub fn total_size(&self) -> u64 {
         // O(1) instead of O(n) - cached!
         self.total_size.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 }
 

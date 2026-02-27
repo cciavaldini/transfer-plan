@@ -146,12 +146,23 @@ async fn folder_transfer_is_alphabetical_and_removes_empty_source_folder() -> Re
     assert!(queue.is_empty());
     assert!(!source_dir.exists());
 
-    assert_eq!(fs::read(destination_root.join("docs").join("alpha.txt"))?, b"alpha");
     assert_eq!(
-        fs::read(destination_root.join("docs").join("nested").join("beta.txt"))?,
+        fs::read(destination_root.join("docs").join("alpha.txt"))?,
+        b"alpha"
+    );
+    assert_eq!(
+        fs::read(
+            destination_root
+                .join("docs")
+                .join("nested")
+                .join("beta.txt")
+        )?,
         b"beta"
     );
-    assert_eq!(fs::read(destination_root.join("docs").join("zeta.txt"))?, b"zeta");
+    assert_eq!(
+        fs::read(destination_root.join("docs").join("zeta.txt"))?,
+        b"zeta"
+    );
 
     Ok(())
 }

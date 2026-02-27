@@ -167,16 +167,24 @@ fn clear_queue_checkpoint() -> Result<()> {
     }
 }
 
-fn save_queue_checkpoint(queue: &TransferQueue) -> Result<()> {
+fn save_queue_checkpoint(queue: &TransferQueue, last_saved_revision: &mut u64) -> Result<()> {
+    let revision = queue.revision();
+    if revision == *last_saved_revision {
+        return Ok(());
+    }
+
     let items = queue.snapshot_items();
     if items.is_empty() {
-        return clear_queue_checkpoint();
+        clear_queue_checkpoint()?;
+        *last_saved_revision = revision;
+        return Ok(());
     }
 
     let checkpoint = QueueCheckpoint { items };
-    let json = serde_json::to_string_pretty(&checkpoint)?;
+    let json = serde_json::to_vec(&checkpoint)?;
     fs::write(QUEUE_CHECKPOINT_FILE, json)
         .with_context(|| format!("Failed to write {}", QUEUE_CHECKPOINT_FILE))?;
+    *last_saved_revision = revision;
     Ok(())
 }
 
@@ -263,6 +271,7 @@ async fn main() -> Result<()> {
     // Create transfer queue
     let queue = Arc::new(TransferQueue::new());
     let stop_requested = Arc::new(AtomicBool::new(false));
+    let mut last_saved_revision = u64::MAX;
 
     let startup_config = UserConfig::load();
     print_config_validation(&startup_config);
@@ -400,7 +409,7 @@ async fn main() -> Result<()> {
             });
         }
 
-        save_queue_checkpoint(queue.as_ref())?;
+        save_queue_checkpoint(queue.as_ref(), &mut last_saved_revision)?;
     }
 
     // Get transfer options
@@ -464,7 +473,7 @@ async fn main() -> Result<()> {
             num_workers.to_string().green().bold()
         );
 
-        save_queue_checkpoint(queue.as_ref())?;
+        save_queue_checkpoint(queue.as_ref(), &mut last_saved_revision)?;
 
         let outcome = transfer_worker_pool(
             queue.clone(),
@@ -476,7 +485,7 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-        save_queue_checkpoint(queue.as_ref())?;
+        save_queue_checkpoint(queue.as_ref(), &mut last_saved_revision)?;
 
         if outcome.stopped_by_user || stop_requested.load(Ordering::Relaxed) {
             println!(
@@ -503,7 +512,7 @@ async fn main() -> Result<()> {
                 println!("{} {}", "Warning:".yellow(), e);
                 break;
             }
-            save_queue_checkpoint(queue.as_ref())?;
+            save_queue_checkpoint(queue.as_ref(), &mut last_saved_revision)?;
             // Loop continues, will transfer the new files
         } else {
             // User doesn't want to add more, exit loop
@@ -514,7 +523,7 @@ async fn main() -> Result<()> {
     if queue.is_empty() {
         clear_queue_checkpoint()?;
     } else {
-        save_queue_checkpoint(queue.as_ref())?;
+        save_queue_checkpoint(queue.as_ref(), &mut last_saved_revision)?;
     }
 
     if stop_requested.load(Ordering::Relaxed) {
