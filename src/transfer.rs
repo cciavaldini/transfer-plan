@@ -229,7 +229,6 @@ fn copy_file_copy_file_range(
             }
             Err(Errno::EINVAL) | Err(Errno::ENOSYS) | Err(Errno::EXDEV) => {
                 // Filesystem/kernel doesn't support copy_file_range, fall back to io::copy
-                progress.set_message("⚠️ copy_file_range not supported, using fallback");
                 rollback_file_attempt_progress(&progress, &copied_bytes, &overall_progress);
                 drop(src_file);
                 drop(dst_file);
@@ -238,9 +237,7 @@ fn copy_file_copy_file_range(
                 let _ = fs::remove_file(destination);
 
                 // Fall back to io::copy
-                return Err(anyhow::anyhow!(
-                    "copy_file_range not supported, need fallback"
-                ));
+                return Err(anyhow::anyhow!("zero-copy unavailable"));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("copy_file_range error: {}", e));
@@ -306,16 +303,6 @@ pub fn copy_file_optimized(
     // Check if file is too large for verification
     let can_verify = verify && file_size <= VERIFICATION_SIZE_LIMIT;
 
-    // Update progress message for large files
-    if verify && file_size > VERIFICATION_SIZE_LIMIT {
-        let file_name = source.file_name().unwrap_or_default().to_string_lossy();
-        progress.set_message(format!(
-            "📄 {} ({} - verification skipped)",
-            file_name,
-            format_size(file_size)
-        ));
-    }
-
     let mut attempt = 0;
     let mut last_error = None;
     let mut use_copy_file_range = file_size >= COPY_FILE_RANGE_THRESHOLD;
@@ -333,7 +320,8 @@ pub fn copy_file_optimized(
                 file_size,
             ) {
                 Ok(_) => Ok(()),
-                Err(e) if e.to_string().contains("copy_file_range not supported") => {
+                Err(e) if e.to_string().contains("zero-copy unavailable") => {
+                    progress.set_message("zero-copy unavailable".to_string());
                     // Fall back to io::copy for this file
                     use_copy_file_range = false;
                     copy_file_iocopy(
@@ -374,11 +362,6 @@ pub fn copy_file_optimized(
                             if attempt == MAX_RETRIES {
                                 anyhow::bail!("Verification failed after {} attempts", MAX_RETRIES);
                             }
-                            progress.set_message(format!(
-                                "⚠️ Verification failed, retry {}/{}",
-                                attempt + 1,
-                                MAX_RETRIES
-                            ));
                         }
                         Err(e) => {
                             rollback_file_attempt_progress(
@@ -390,11 +373,6 @@ pub fn copy_file_optimized(
                                 return Err(e);
                             }
                             last_error = Some(e);
-                            progress.set_message(format!(
-                                "⚠️ Verification error, retry {}/{}",
-                                attempt + 1,
-                                MAX_RETRIES
-                            ));
                         }
                     }
                 } else {
@@ -407,7 +385,6 @@ pub fn copy_file_optimized(
                     return Err(e);
                 }
                 last_error = Some(e);
-                progress.set_message(format!("⚠️ Retry {}/{}", attempt + 1, MAX_RETRIES));
             }
         }
 

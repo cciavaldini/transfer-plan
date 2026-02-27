@@ -6,8 +6,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::fs;
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,11 +24,12 @@ const SYNC_ESTIMATE_BASE_OVERHEAD_SECS: f64 = 3.0;
 const SYNC_ESTIMATE_SAFETY_MULTIPLIER: f64 = 1.5;
 const SYNC_MONITOR_INTERVAL_MS: u64 = 300;
 const FILE_PROGRESS_BAR_THRESHOLD: u64 = 8 * 1024 * 1024;
+const FILE_PROGRESS_LABEL_WIDTH: usize = 48;
 
 static FILE_PROGRESS_STYLE: Lazy<ProgressStyle> = Lazy::new(|| {
     ProgressStyle::default_bar()
         .template(
-            "  {msg} [{bar:30.green/white}] {bytes}/{total_bytes} ({eta}) {binary_bytes_per_sec:.cyan}",
+            "{prefix} [{bar:30.green/white}] {bytes}/{total_bytes} ({eta}) {binary_bytes_per_sec:.cyan} {msg}",
         )
         .unwrap()
         .progress_chars("█▓▒░-")
@@ -109,6 +110,33 @@ fn format_eta(seconds: u64) -> String {
     format!("{:02}:{:02}:{:02}", hours, minutes, secs)
 }
 
+fn truncate_for_display(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let len = input.chars().count();
+    if len <= max_chars {
+        return input.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut truncated = input.chars().take(max_chars - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn format_file_progress_label(worker_id: usize, file_name: &str) -> String {
+    let prefix = format!("[W{}] ", worker_id);
+    let max_name_chars = FILE_PROGRESS_LABEL_WIDTH.saturating_sub(prefix.chars().count());
+    let short_name = truncate_for_display(file_name, max_name_chars);
+    let label = format!("{}{}", prefix, short_name);
+    format!("{:<width$}", label, width = FILE_PROGRESS_LABEL_WIDTH)
+}
+
 fn fallback_sync() {
     #[cfg(target_family = "unix")]
     unsafe {
@@ -175,11 +203,11 @@ fn smooth_speed(previous: f64, current_sample: f64) -> f64 {
     }
 }
 
-fn push_sync_target(sync_targets: &Arc<Mutex<Vec<std::path::PathBuf>>>, destination: &std::path::Path) {
-    let target = destination
-        .parent()
-        .unwrap_or(destination)
-        .to_path_buf();
+fn push_sync_target(
+    sync_targets: &Arc<Mutex<Vec<std::path::PathBuf>>>,
+    destination: &std::path::Path,
+) {
+    let target = destination.parent().unwrap_or(destination).to_path_buf();
     let mut guard = sync_targets.lock().unwrap_or_else(|e| e.into_inner());
     guard.push(target);
 }
@@ -492,14 +520,12 @@ fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) {
             .to_string_lossy()
             .to_string();
 
-        let worker_prefix = if worker_id > 0 {
-            format!("[W{}] ", worker_id)
-        } else {
-            String::new()
-        };
+        let worker_prefix = format!("[W{}] ", worker_id);
+        let progress_label = format_file_progress_label(worker_id, &file_name);
 
         if show_file_progress {
-            file_pb.set_message(format!("{}📄 {}", worker_prefix, file_name));
+            file_pb.set_prefix(progress_label);
+            file_pb.set_message("");
         }
 
         push_sync_target(&sync_targets, &item.destination);

@@ -6,7 +6,7 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{Completer, Config, Editor, Helper, Highlighter, Hinter, Validator};
 use rustyline::{CompletionType, EditMode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub fn print_banner() {
@@ -59,6 +59,288 @@ fn new_path_editor() -> Result<Editor<PathCompleter, DefaultHistory>> {
     Ok(editor)
 }
 
+enum SourceInput {
+    Retry,
+    Finish,
+    Path(PathBuf),
+}
+
+fn resolve_user_path(input: &str, default_base: &Path) -> PathBuf {
+    let expanded = shellexpand::tilde(input);
+    let path = PathBuf::from(expanded.to_string());
+    if path.is_relative() {
+        default_base.join(path)
+    } else {
+        path
+    }
+}
+
+fn validate_source_path(source: &Path) -> Result<()> {
+    if !source.exists() {
+        anyhow::bail!("Path does not exist: {}", source.display());
+    }
+
+    if source.is_file() {
+        std::fs::File::open(source)
+            .map_err(|e| anyhow::anyhow!("Cannot read file (permission denied): {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn print_source_info(source: &Path) -> Result<()> {
+    if source.is_file() {
+        let size = std::fs::metadata(source)?.len();
+        println!(
+            "  {} File: {} ({:.2} MB)",
+            "✓".green(),
+            source.display(),
+            size as f64 / 1_000_000.0
+        );
+    } else if source.is_dir() {
+        println!("  {} Directory: {}", "✓".green(), source.display());
+    }
+
+    Ok(())
+}
+
+fn print_source_destination(source: &Path, destination: &Path) {
+    println!(
+        "  {} {} → {}",
+        "→".cyan().bold(),
+        source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .cyan(),
+        destination.display().to_string().yellow()
+    );
+}
+
+fn print_added_source_destination(source: &Path, destination: &Path) {
+    println!(
+        "  {} Added: {} → {}",
+        "→".cyan().bold(),
+        source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .cyan(),
+        destination.display().to_string().yellow()
+    );
+}
+
+fn prompt_destination_path(
+    editor: &mut Editor<PathCompleter, DefaultHistory>,
+    default_destination: &Path,
+    show_subfolder_hint: bool,
+    show_interrupt_default_hint: bool,
+) -> Result<PathBuf> {
+    let dest_default = default_destination.to_string_lossy().to_string();
+
+    println!(
+        "  {} Press Enter for{}: {}",
+        "ℹ".cyan(),
+        if show_subfolder_hint { " default" } else { "" },
+        default_destination.display().to_string().yellow()
+    );
+    if show_subfolder_hint {
+        println!(
+            "  {} Or edit to specify subfolder (e.g., work/reports)",
+            "ℹ".cyan()
+        );
+    }
+
+    match editor.readline_with_initial("Destination path: ", (&dest_default, "")) {
+        Ok(line) => {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == dest_default {
+                println!(
+                    "  {} Using default: {}",
+                    "✓".green(),
+                    default_destination.display()
+                );
+                return Ok(default_destination.to_path_buf());
+            }
+
+            let final_path = resolve_user_path(trimmed, default_destination);
+            if !final_path.exists() {
+                std::fs::create_dir_all(&final_path)?;
+                println!("  {} Created: {}", "✓".green(), final_path.display());
+            } else {
+                println!("  {} Using: {}", "✓".green(), final_path.display());
+            }
+
+            Ok(final_path)
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            if show_interrupt_default_hint {
+                println!("  {} Using default", "→".cyan());
+            }
+            Ok(default_destination.to_path_buf())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn prompt_mapping_source_path(
+    editor: &mut Editor<PathCompleter, DefaultHistory>,
+    default_source: &Path,
+    has_existing_mappings: bool,
+) -> Result<SourceInput> {
+    let source_default = default_source.to_string_lossy().to_string();
+
+    match editor.readline_with_initial("Source path: ", (&source_default, "")) {
+        Ok(line) => {
+            let trimmed = line.trim();
+            if trimmed == source_default {
+                if has_existing_mappings {
+                    return Ok(SourceInput::Finish);
+                }
+                println!(
+                    "{}",
+                    "  ℹ  Edit the path or press Ctrl+D to cancel".yellow()
+                );
+                return Ok(SourceInput::Retry);
+            }
+
+            let abs_path = resolve_user_path(trimmed, default_source);
+            if let Err(e) = validate_source_path(&abs_path) {
+                println!("{}", format!("  ✗ {}", e).red());
+                return Ok(SourceInput::Retry);
+            }
+
+            Ok(SourceInput::Path(abs_path))
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            if has_existing_mappings {
+                Ok(SourceInput::Finish)
+            } else {
+                println!("\n{}", "No mappings configured. Exiting.".yellow());
+                Err(anyhow::anyhow!("No files to transfer"))
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn prompt_additional_source_path(
+    editor: &mut Editor<PathCompleter, DefaultHistory>,
+    default_source: &Path,
+    files_added: usize,
+) -> Result<SourceInput> {
+    let source_default = default_source.to_string_lossy().to_string();
+
+    match editor.readline_with_initial("\nSource path: ", (&source_default, "")) {
+        Ok(line) => {
+            let trimmed = line.trim();
+            if trimmed == source_default || trimmed.is_empty() {
+                if files_added == 0 {
+                    println!("{}", "  ℹ No files added".yellow());
+                }
+                return Ok(SourceInput::Finish);
+            }
+
+            let abs_path = resolve_user_path(trimmed, default_source);
+            if let Err(e) = validate_source_path(&abs_path) {
+                println!("{}", format!("  ✗ {}", e).red());
+                return Ok(SourceInput::Retry);
+            }
+
+            Ok(SourceInput::Path(abs_path))
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => Ok(SourceInput::Finish),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn load_or_prompt_default_source(
+    config: &mut UserConfig,
+    editor: &mut Editor<PathCompleter, DefaultHistory>,
+) -> Result<PathBuf> {
+    if let Some(ref source) = config.default_source_folder {
+        println!(
+            "\n{} {}",
+            "Default source folder:".yellow().bold(),
+            source.display().to_string().cyan()
+        );
+        return Ok(source.clone());
+    }
+
+    println!("\n{}", "DEFAULT SOURCE FOLDER:".yellow().bold());
+    println!("This will be used as the starting point for browsing");
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
+    let default_path = home.clone();
+
+    match editor.readline_with_initial("Enter default source folder: ", (&default_path, "")) {
+        Ok(line) => {
+            let path = if line.trim().is_empty() {
+                PathBuf::from(default_path)
+            } else {
+                PathBuf::from(shellexpand::tilde(&line).to_string())
+            };
+
+            if path.exists() {
+                println!("  {} Saved: {}", "✓".green(), path.display());
+            } else {
+                println!("  {} Will use: {}", "⚠".yellow(), path.display());
+            }
+            config.set_default_source(path.clone())?;
+            Ok(path)
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            Err(anyhow::anyhow!("Cancelled by user"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn load_or_prompt_default_destination(
+    config: &mut UserConfig,
+    editor: &mut Editor<PathCompleter, DefaultHistory>,
+) -> Result<PathBuf> {
+    if let Some(ref dest) = config.default_destination_folder {
+        println!(
+            "{} {}",
+            "Default destination folder:".yellow().bold(),
+            dest.display().to_string().cyan()
+        );
+        return Ok(dest.clone());
+    }
+
+    println!(
+        "\n{}",
+        "DEFAULT DESTINATION FOLDER (USB drive):".yellow().bold()
+    );
+    println!("This is the root of your USB drive");
+
+    let suggested = String::from("/media/usb");
+
+    match editor.readline_with_initial("Enter USB drive path: ", (&suggested, "")) {
+        Ok(line) => {
+            let path = if line.trim().is_empty() {
+                PathBuf::from(suggested)
+            } else {
+                PathBuf::from(shellexpand::tilde(&line).to_string())
+            };
+
+            if !path.exists() {
+                println!("  {} Creating: {}", "⚠".yellow(), path.display());
+                std::fs::create_dir_all(&path)?;
+            }
+
+            println!("  {} Saved: {}", "✓".green(), path.display());
+            config.set_default_destination(path.clone())?;
+            Ok(path)
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            Err(anyhow::anyhow!("Cancelled by user"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn get_transfer_mappings() -> Result<(Vec<TransferMapping>, PathBuf)> {
     // Load user configuration
     let mut config = UserConfig::load();
@@ -74,88 +356,8 @@ pub fn get_transfer_mappings() -> Result<(Vec<TransferMapping>, PathBuf)> {
     );
     println!("{}", "═".repeat(60));
 
-    // Get/set default source folder
-    let default_source = if let Some(ref source) = config.default_source_folder {
-        println!(
-            "\n{} {}",
-            "Default source folder:".yellow().bold(),
-            source.display().to_string().cyan()
-        );
-        source.clone()
-    } else {
-        println!("\n{}", "DEFAULT SOURCE FOLDER:".yellow().bold());
-        println!("This will be used as the starting point for browsing");
-
-        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-        let default_path = home.clone();
-
-        match editor.readline_with_initial("Enter default source folder: ", (&default_path, "")) {
-            Ok(line) => {
-                let path = if line.trim().is_empty() {
-                    PathBuf::from(default_path)
-                } else {
-                    PathBuf::from(shellexpand::tilde(&line).to_string())
-                };
-
-                if path.exists() {
-                    println!("  {} Saved: {}", "✓".green(), path.display());
-                } else {
-                    println!("  {} Will use: {}", "⚠".yellow(), path.display());
-                }
-                config.set_default_source(path.clone())?;
-                path
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                return Err(anyhow::anyhow!("Cancelled by user"));
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-    };
-
-    // Get/set default destination folder
-    let default_destination = if let Some(ref dest) = config.default_destination_folder {
-        println!(
-            "{} {}",
-            "Default destination folder:".yellow().bold(),
-            dest.display().to_string().cyan()
-        );
-        dest.clone()
-    } else {
-        println!(
-            "\n{}",
-            "DEFAULT DESTINATION FOLDER (USB drive):".yellow().bold()
-        );
-        println!("This is the root of your USB drive");
-
-        let suggested = String::from("/media/usb");
-
-        match editor.readline_with_initial("Enter USB drive path: ", (&suggested, "")) {
-            Ok(line) => {
-                let path = if line.trim().is_empty() {
-                    PathBuf::from(suggested)
-                } else {
-                    PathBuf::from(shellexpand::tilde(&line).to_string())
-                };
-
-                if !path.exists() {
-                    println!("  {} Creating: {}", "⚠".yellow(), path.display());
-                    std::fs::create_dir_all(&path)?;
-                }
-
-                println!("  {} Saved: {}", "✓".green(), path.display());
-                config.set_default_destination(path.clone())?;
-                path
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                return Err(anyhow::anyhow!("Cancelled by user"));
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-    };
+    let default_source = load_or_prompt_default_source(&mut config, &mut editor)?;
+    let default_destination = load_or_prompt_default_destination(&mut config, &mut editor)?;
 
     // Now get source → destination mappings
     println!("\n{}", "═".repeat(60));
@@ -173,153 +375,17 @@ pub fn get_transfer_mappings() -> Result<(Vec<TransferMapping>, PathBuf)> {
     let mut mapping_number = 1;
 
     loop {
-        // Get source path with auto-completion, pre-filled with default source
-        let source_default = default_source.to_string_lossy().to_string();
-        let source = match editor.readline_with_initial("Source path: ", (&source_default, "")) {
-            Ok(line) => {
-                let trimmed = line.trim();
-
-                // If empty or unchanged, ask if user wants to finish
-                if trimmed == source_default {
-                    if mappings.is_empty() {
-                        println!(
-                            "{}",
-                            "  ℹ  Edit the path or press Ctrl+D to cancel".yellow()
-                        );
-                        continue;
-                    }
-                    // User didn't change it, probably wants to finish
-                    break;
-                }
-
-                // Expand ~ and handle relative paths
-                let expanded = shellexpand::tilde(trimmed);
-                let path = PathBuf::from(expanded.to_string());
-
-                // Make absolute if relative
-                let abs_path = if path.is_relative() {
-                    default_source.join(&path)
-                } else {
-                    path
-                };
-
-                if !abs_path.exists() {
-                    println!(
-                        "{}",
-                        format!("  ✗ Path does not exist: {}", abs_path.display()).red()
-                    );
-                    continue;
-                }
-
-                // Check read permissions for source files
-                if abs_path.is_file() {
-                    match std::fs::File::open(&abs_path) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            println!(
-                                "{}",
-                                format!("  ✗ Cannot read file (permission denied): {}", e).red()
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                abs_path
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                if mappings.is_empty() {
-                    println!("\n{}", "No mappings configured. Exiting.".yellow());
-                    return Err(anyhow::anyhow!("No files to transfer"));
-                }
-                break;
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        };
+        let source =
+            match prompt_mapping_source_path(&mut editor, &default_source, !mappings.is_empty())? {
+                SourceInput::Retry => continue,
+                SourceInput::Finish => break,
+                SourceInput::Path(path) => path,
+            };
 
         println!("\n{}", format!("Mapping #{}", mapping_number).cyan().bold());
-
-        // Display source info
-        if source.is_file() {
-            let size = std::fs::metadata(&source)?.len();
-            println!(
-                "  {} File: {} ({:.2} MB)",
-                "✓".green(),
-                source.display(),
-                size as f64 / 1_000_000.0
-            );
-        } else if source.is_dir() {
-            println!("  {} Directory: {}", "✓".green(), source.display());
-        }
-
-        // Get destination (subfolder or default) - pre-fill with default destination
-        let dest_default = default_destination.to_string_lossy().to_string();
-        let dest_prompt = "Destination path: ";
-
-        println!(
-            "  {} Press Enter for default: {}",
-            "ℹ".cyan(),
-            default_destination.display().to_string().yellow()
-        );
-        println!(
-            "  {} Or edit to specify subfolder (e.g., work/reports)",
-            "ℹ".cyan()
-        );
-
-        let destination = match editor.readline_with_initial(dest_prompt, (&dest_default, "")) {
-            Ok(line) => {
-                let trimmed = line.trim();
-
-                // If unchanged or empty, use default
-                if trimmed.is_empty() || trimmed == dest_default {
-                    println!(
-                        "  {} Using default: {}",
-                        "✓".green(),
-                        default_destination.display()
-                    );
-                    default_destination.clone()
-                } else {
-                    // User edited - check if it's a full path or subfolder
-                    let expanded = shellexpand::tilde(trimmed);
-                    let path = PathBuf::from(expanded.to_string());
-
-                    // If absolute path, use as-is; if relative, join with default
-                    let final_path = if path.is_absolute() {
-                        path
-                    } else {
-                        default_destination.join(&path)
-                    };
-
-                    if !final_path.exists() {
-                        std::fs::create_dir_all(&final_path)?;
-                        println!("  {} Created: {}", "✓".green(), final_path.display());
-                    } else {
-                        println!("  {} Using: {}", "✓".green(), final_path.display());
-                    }
-                    final_path
-                }
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                println!("  {} Using default", "→".cyan());
-                default_destination.clone()
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        };
-
-        println!(
-            "  {} {} → {}",
-            "→".cyan().bold(),
-            source
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .cyan(),
-            destination.display().to_string().yellow()
-        );
+        print_source_info(&source)?;
+        let destination = prompt_destination_path(&mut editor, &default_destination, true, true)?;
+        print_source_destination(&source, &destination);
 
         mappings.push(TransferMapping {
             source,
@@ -352,7 +418,10 @@ pub fn get_transfer_options() -> Result<(usize, bool, bool, String)> {
         .unwrap_or(2);
     let suggested_workers = 2usize.min(max_workers);
     let default_workers = suggested_workers.to_string();
-    let workers_prompt = format!("Parallel workers (1-{}) [{}]: ", max_workers, suggested_workers);
+    let workers_prompt = format!(
+        "Parallel workers (1-{}) [{}]: ",
+        max_workers, suggested_workers
+    );
     let num_workers = match editor.readline_with_initial(&workers_prompt, (&default_workers, "")) {
         Ok(line) => line
             .trim()
@@ -437,153 +506,25 @@ pub async fn add_more_files(
     let mut files_added = 0;
 
     loop {
-        // Get source path
-        let source_default = default_source.to_string_lossy().to_string();
-        let source = match editor.readline_with_initial("\nSource path: ", (&source_default, "")) {
-            Ok(line) => {
-                let trimmed = line.trim();
-
-                // If unchanged or empty, user is done
-                if trimmed == source_default || trimmed.is_empty() {
-                    if files_added == 0 {
-                        println!("{}", "  ℹ No files added".yellow());
-                    }
-                    break;
-                }
-
-                // Expand ~ and handle relative paths
-                let expanded = shellexpand::tilde(trimmed);
-                let path = PathBuf::from(expanded.to_string());
-
-                // Make absolute if relative
-                let abs_path = if path.is_relative() {
-                    default_source.join(&path)
-                } else {
-                    path
-                };
-
-                if !abs_path.exists() {
-                    println!(
-                        "{}",
-                        format!("  ✗ Path does not exist: {}", abs_path.display()).red()
-                    );
-                    continue;
-                }
-
-                // Check read permissions for source files
-                if abs_path.is_file() {
-                    match std::fs::File::open(&abs_path) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            println!(
-                                "{}",
-                                format!("  ✗ Cannot read file (permission denied): {}", e).red()
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                abs_path
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                break;
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
+        let source = match prompt_additional_source_path(&mut editor, &default_source, files_added)?
+        {
+            SourceInput::Retry => continue,
+            SourceInput::Finish => break,
+            SourceInput::Path(path) => path,
         };
 
-        // Display source info
-        if source.is_file() {
-            let size = std::fs::metadata(&source)?.len();
-            println!(
-                "  {} File: {} ({:.2} MB)",
-                "✓".green(),
-                source.display(),
-                size as f64 / 1_000_000.0
-            );
-        } else if source.is_dir() {
-            println!("  {} Directory: {}", "✓".green(), source.display());
-        }
-
-        // Get destination
-        let dest_default = default_destination.to_string_lossy().to_string();
-        println!(
-            "  {} Press Enter for: {}",
-            "ℹ".cyan(),
-            default_destination.display().to_string().yellow()
-        );
-
-        let destination =
-            match editor.readline_with_initial("Destination path: ", (&dest_default, "")) {
-                Ok(line) => {
-                    let trimmed = line.trim();
-
-                    // If unchanged or empty, use default
-                    if trimmed.is_empty() || trimmed == dest_default {
-                        println!(
-                            "  {} Using default: {}",
-                            "✓".green(),
-                            default_destination.display()
-                        );
-                        default_destination.clone()
-                    } else {
-                        // User edited - check if it's a full path or subfolder
-                        let expanded = shellexpand::tilde(trimmed);
-                        let path = PathBuf::from(expanded.to_string());
-
-                        // If absolute path, use as-is; if relative, join with default
-                        let final_path = if path.is_absolute() {
-                            path
-                        } else {
-                            default_destination.join(&path)
-                        };
-
-                        if !final_path.exists() {
-                            std::fs::create_dir_all(&final_path)?;
-                            println!("  {} Created: {}", "✓".green(), final_path.display());
-                        } else {
-                            println!("  {} Using: {}", "✓".green(), final_path.display());
-                        }
-                        final_path
-                    }
-                }
-                Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                    default_destination.clone()
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            };
+        print_source_info(&source)?;
+        let destination = prompt_destination_path(&mut editor, &default_destination, false, false)?;
 
         // Add to queue
         if source.is_file() {
             queue.add_file(source.clone(), &destination)?;
-            println!(
-                "  {} Added: {} → {}",
-                "→".cyan().bold(),
-                source
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .cyan(),
-                destination.display().to_string().yellow()
-            );
+            print_added_source_destination(&source, &destination);
             files_added += 1;
         } else if source.is_dir() {
             println!("  {} Scanning directory...", "📁".cyan());
             queue.add_directory(&source, &destination)?;
-            println!(
-                "  {} Added: {} → {}",
-                "→".cyan().bold(),
-                source
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .cyan(),
-                destination.display().to_string().yellow()
-            );
+            print_added_source_destination(&source, &destination);
             files_added += 1;
         }
     }
