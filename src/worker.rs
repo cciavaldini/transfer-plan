@@ -15,7 +15,11 @@ const QUEUE_POLL_INTERVAL_MS: u64 = 50;
 const MONITOR_INTERVAL_MS: u64 = 1500;
 const QUEUE_SETTLE_MS: u64 = 500;
 const SPEED_SMOOTHING_ALPHA: f64 = 0.35;
-const MAX_PENDING_SYNC_ESTIMATE_SECS: f64 = 600.0;
+const MAX_PENDING_SYNC_ESTIMATE_SECS: f64 = 1800.0;
+const SYNC_ESTIMATE_SPEED_FACTOR: f64 = 0.35;
+const SYNC_ESTIMATE_MAX_FLUSH_SPEED_BPS: f64 = 120.0 * 1_000_000.0;
+const SYNC_ESTIMATE_FALLBACK_SPEED_BPS: f64 = 25.0 * 1_000_000.0;
+const SYNC_ESTIMATE_BASE_OVERHEAD_SECS: f64 = 3.0;
 const FILE_PROGRESS_BAR_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 static FILE_PROGRESS_STYLE: Lazy<ProgressStyle> = Lazy::new(|| {
@@ -145,11 +149,20 @@ fn estimate_pending_sync_secs(smoothed_speed_bps: f64) -> Option<f64> {
     }
 
     let pending_bytes = (dirty_kb.unwrap_or(0) + writeback_kb.unwrap_or(0)) * 1024;
-    if pending_bytes == 0 || smoothed_speed_bps <= 0.0 {
+    if pending_bytes == 0 {
         return Some(0.0);
     }
 
-    Some((pending_bytes as f64 / smoothed_speed_bps).clamp(0.0, MAX_PENDING_SYNC_ESTIMATE_SECS))
+    // Sync flush throughput is usually lower than copy throughput; keep estimate conservative.
+    let estimated_flush_speed_bps = if smoothed_speed_bps > 0.0 {
+        (smoothed_speed_bps * SYNC_ESTIMATE_SPEED_FACTOR).min(SYNC_ESTIMATE_MAX_FLUSH_SPEED_BPS)
+    } else {
+        SYNC_ESTIMATE_FALLBACK_SPEED_BPS
+    };
+
+    let estimated_secs =
+        SYNC_ESTIMATE_BASE_OVERHEAD_SECS + (pending_bytes as f64 / estimated_flush_speed_bps);
+    Some(estimated_secs.clamp(0.0, MAX_PENDING_SYNC_ESTIMATE_SECS))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -365,7 +378,7 @@ pub async fn transfer_worker_pool(
     let overall_pb = multi_progress.add(ProgressBar::new(0));
     overall_pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -443,14 +456,22 @@ pub async fn transfer_worker_pool(
 
             let remaining_bytes = total_size.saturating_sub(transferred_bytes);
             let remaining_files = max_total_files.saturating_sub(completed + failed);
+            let remaining_transfer_secs = if smoothed_speed_bps > 0.0 {
+                Some(remaining_bytes as f64 / smoothed_speed_bps)
+            } else {
+                None
+            };
+            let total_remaining = remaining_transfer_secs
+                .map(|secs| format_eta((secs + pending_sync_secs).ceil() as u64))
+                .unwrap_or_else(|| "estimating...".to_string());
             overall_pb_clone.set_message(format!(
-                "Files: {}/{} | Remaining: {} ({} files) | Avg: {:.1} MB/s | Pending sync est: {:.1}s",
+                "Files: {}/{} | Remaining: {} ({} files) | Total remaining: {} | Avg: {:.1} MB/s",
                 completed,
                 max_total_files,
                 format_size(remaining_bytes),
                 remaining_files,
+                total_remaining,
                 throughput_avg,
-                pending_sync_secs,
             ));
 
             // Check for commands
