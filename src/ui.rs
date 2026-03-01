@@ -406,7 +406,7 @@ pub fn get_transfer_mappings() -> Result<(Vec<TransferMapping>, PathBuf)> {
     Ok((mappings, default_destination))
 }
 
-pub fn get_transfer_options() -> Result<(usize, bool, bool, String)> {
+pub fn get_transfer_options() -> Result<(usize, bool, bool, String, bool)> {
     let mut editor: Editor<(), DefaultHistory> = Editor::new()?;
 
     println!("\n{}", "Transfer Options:".cyan().bold());
@@ -439,6 +439,17 @@ pub fn get_transfer_options() -> Result<(usize, bool, bool, String)> {
         Err(_) => false,
     };
 
+    // Update mode (skip unchanged destination files)
+    let update_mode = match editor
+        .readline_with_initial("Skip unchanged files (update mode)? (Y/n): ", ("Y", ""))
+    {
+        Ok(line) => {
+            let response = line.trim();
+            response.is_empty() || response.eq_ignore_ascii_case("y")
+        }
+        Err(_) => true,
+    };
+
     // Unmount
     let unmount = match editor
         .readline_with_initial("Auto-unmount USB after completion? (y/N): ", ("N", ""))
@@ -468,22 +479,24 @@ pub fn get_transfer_options() -> Result<(usize, bool, bool, String)> {
 
     println!("{}", "─".repeat(60));
     println!(
-        "{} {} workers | Verify: {} | Unmount: {} | Cleanup: {}",
+        "{} {} workers | Verify: {} | Update: {} | Unmount: {} | Cleanup: {}",
         "✓".green().bold(),
         num_workers,
         if verify { "Yes" } else { "No" },
+        if update_mode { "Yes" } else { "No" },
         if unmount { "Yes" } else { "No" },
         cleanup_mode
     );
     println!("{}", "═".repeat(60));
 
-    Ok((num_workers, verify, unmount, cleanup_mode))
+    Ok((num_workers, verify, unmount, cleanup_mode, update_mode))
 }
 
 /// Add more files after a transfer batch completes
 pub async fn add_more_files(
     queue: Arc<crate::queue::TransferQueue>,
     default_destination: PathBuf,
+    update_mode: bool,
 ) -> Result<()> {
     use crate::config::UserConfig;
 
@@ -518,14 +531,27 @@ pub async fn add_more_files(
 
         // Add to queue
         if source.is_file() {
-            queue.add_file(source.clone(), &destination)?;
-            print_added_source_destination(&source, &destination);
-            files_added += 1;
+            let summary = queue.add_file_with_policy(source.clone(), &destination, update_mode)?;
+            if summary.queued_files > 0 {
+                print_added_source_destination(&source, &destination);
+                files_added += 1;
+            } else if summary.skipped_files > 0 {
+                println!("  {} Skipped unchanged: {}", "↷".yellow(), source.display());
+            }
         } else if source.is_dir() {
             println!("  {} Scanning directory...", "📁".cyan());
-            queue.add_directory(&source, &destination)?;
-            print_added_source_destination(&source, &destination);
-            files_added += 1;
+            let summary = queue.add_directory_with_policy(&source, &destination, update_mode)?;
+            if summary.queued_files > 0 {
+                print_added_source_destination(&source, &destination);
+                files_added += 1;
+            }
+            if summary.skipped_files > 0 {
+                println!(
+                    "  {} Skipped unchanged files: {}",
+                    "↷".yellow(),
+                    summary.skipped_files
+                );
+            }
         }
     }
 

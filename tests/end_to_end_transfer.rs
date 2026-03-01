@@ -29,8 +29,8 @@ async fn end_to_end_transfer_copies_files_and_keeps_sources() -> Result<()> {
     fs::write(&nested_file, vec![7u8; 4096])?;
 
     let queue = Arc::new(TransferQueue::new());
-    queue.add_file(source_file.clone(), &destination_root)?;
-    queue.add_directory(&source_dir, &destination_root)?;
+    queue.add_file_with_policy(source_file.clone(), &destination_root, false)?;
+    queue.add_directory_with_policy(&source_dir, &destination_root, false)?;
 
     let outcome = transfer_worker_pool(
         queue.clone(),
@@ -71,7 +71,7 @@ async fn end_to_end_transfer_with_delete_cleanup_removes_sources() -> Result<()>
     fs::write(&source_file, b"delete after transfer")?;
 
     let queue = Arc::new(TransferQueue::new());
-    queue.add_file(source_file.clone(), &destination_root)?;
+    queue.add_file_with_policy(source_file.clone(), &destination_root, false)?;
 
     let outcome = transfer_worker_pool(
         queue.clone(),
@@ -108,7 +108,7 @@ async fn folder_transfer_is_alphabetical_and_removes_empty_source_folder() -> Re
     fs::write(source_dir.join("nested").join("beta.txt"), b"beta")?;
 
     let queue = Arc::new(TransferQueue::new());
-    queue.add_directory(&source_dir, &destination_root)?;
+    queue.add_directory_with_policy(&source_dir, &destination_root, false)?;
 
     let ordered = queue
         .snapshot_items()

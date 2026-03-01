@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferItem {
@@ -36,6 +37,38 @@ pub struct TransferQueue {
     revision: Arc<AtomicU64>,
     cmd_tx: Sender<QueueCommand>,
     cmd_rx: Receiver<QueueCommand>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueueAddSummary {
+    pub queued_files: usize,
+    pub skipped_files: usize,
+}
+
+const UPDATE_MTIME_TOLERANCE_SECS: u64 = 2;
+
+fn mtime_close_enough(src: SystemTime, dst: SystemTime) -> bool {
+    let diff = if src >= dst {
+        src.duration_since(dst)
+    } else {
+        dst.duration_since(src)
+    };
+    diff.map(|d| d.as_secs() <= UPDATE_MTIME_TOLERANCE_SECS)
+        .unwrap_or(false)
+}
+
+fn destination_is_unchanged(source_meta: &fs::Metadata, destination: &Path) -> bool {
+    let Ok(dest_meta) = fs::metadata(destination) else {
+        return false;
+    };
+    if !dest_meta.is_file() || source_meta.len() != dest_meta.len() {
+        return false;
+    }
+
+    match (source_meta.modified(), dest_meta.modified()) {
+        (Ok(src_mtime), Ok(dst_mtime)) => mtime_close_enough(src_mtime, dst_mtime),
+        _ => false,
+    }
 }
 
 impl TransferQueue {
@@ -85,29 +118,51 @@ impl TransferQueue {
         Ok(())
     }
 
-    pub fn add_file(&self, source: PathBuf, dest_root: &Path) -> Result<()> {
+    pub fn add_file_with_policy(
+        &self,
+        source: PathBuf,
+        dest_root: &Path,
+        update_mode: bool,
+    ) -> Result<QueueAddSummary> {
         let metadata = fs::metadata(&source)
             .with_context(|| format!("Failed to read metadata for {:?}", source))?;
         let file_name = source.file_name().context("Invalid file name")?;
         let destination = dest_root.join(file_name);
 
         let size = metadata.len();
+        if update_mode && destination_is_unchanged(&metadata, &destination) {
+            return Ok(QueueAddSummary {
+                skipped_files: 1,
+                ..QueueAddSummary::default()
+            });
+        }
+
         let item = TransferItem {
             source,
             destination,
             size,
             cleanup_root: None,
         };
-        self.enqueue_batch(vec![item], size)
+        self.enqueue_batch(vec![item], size)?;
+        Ok(QueueAddSummary {
+            queued_files: 1,
+            ..QueueAddSummary::default()
+        })
     }
 
-    pub fn add_directory(&self, source: &Path, dest_root: &Path) -> Result<()> {
+    pub fn add_directory_with_policy(
+        &self,
+        source: &Path,
+        dest_root: &Path,
+        update_mode: bool,
+    ) -> Result<QueueAddSummary> {
         let dir_name = source.file_name().context("Invalid directory name")?;
         let dest_dir = dest_root.join(dir_name);
 
         // Batch collection - one queue update for the entire directory.
         let mut batch = Vec::new();
         let mut batch_size = 0u64;
+        let mut skipped_files = 0usize;
         let cleanup_root = source.to_path_buf();
 
         for entry in walkdir::WalkDir::new(source) {
@@ -115,7 +170,13 @@ impl TransferQueue {
             if entry.file_type().is_file() {
                 let relative_path = entry.path().strip_prefix(source)?;
                 let destination = dest_dir.join(relative_path);
-                let size = entry.metadata()?.len();
+                let metadata = entry.metadata()?;
+                let size = metadata.len();
+
+                if update_mode && destination_is_unchanged(&metadata, &destination) {
+                    skipped_files += 1;
+                    continue;
+                }
 
                 let item = TransferItem {
                     source: entry.path().to_path_buf(),
@@ -132,7 +193,12 @@ impl TransferQueue {
         // Keep directory transfers deterministic: alphabetical by source path
         batch.sort_unstable_by(|a, b| a.source.cmp(&b.source));
 
-        self.enqueue_batch(batch, batch_size)
+        let queued_files = batch.len();
+        self.enqueue_batch(batch, batch_size)?;
+        Ok(QueueAddSummary {
+            queued_files,
+            skipped_files,
+        })
     }
 
     /// Snapshot current pending items in queue order.
