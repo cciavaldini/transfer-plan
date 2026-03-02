@@ -1,3 +1,5 @@
+//! Helper functions for printing formatted messages in the UI.
+
 use anyhow::Result;
 use colored::*;
 use std::path::Path;

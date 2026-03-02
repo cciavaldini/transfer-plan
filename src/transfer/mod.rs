@@ -1,3 +1,5 @@
+//! Shared transfer utilities and constants.
+
 pub mod helpers;
 pub mod progress;
 pub mod copy;

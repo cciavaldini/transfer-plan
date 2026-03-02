@@ -1,3 +1,6 @@
+//! Configuration handling for transfer-plan, including defaults and loading/
+//! saving from JSON.
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;

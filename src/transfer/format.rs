@@ -1,3 +1,5 @@
+//! Human-readable size formatting helpers.
+
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;

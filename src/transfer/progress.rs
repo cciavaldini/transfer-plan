@@ -1,3 +1,5 @@
+//! Progress-tracking reader wrapper and helpers used during file transfer.
+
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
 use std::sync::Arc;

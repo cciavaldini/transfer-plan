@@ -1,3 +1,5 @@
+//! ASCII banner printing used at program startup.
+
 use colored::*;
 
 pub fn print_banner() {

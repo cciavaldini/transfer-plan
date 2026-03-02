@@ -1,3 +1,6 @@
+//! Pool manager that spawns multiple worker threads and monitors overall
+//! progress.
+
 use crate::queue::{QueueCommand, TransferQueue};
 use anyhow::{Context, Result};
 use colored::Colorize;

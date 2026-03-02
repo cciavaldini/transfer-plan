@@ -1,3 +1,6 @@
+//! Synchronization estimation and flushing utilities used to determine how much
+//! data still needs to be synced to disk.
+
 use anyhow::Result;
 use indicatif::ProgressBar;
 use std::collections::HashSet;

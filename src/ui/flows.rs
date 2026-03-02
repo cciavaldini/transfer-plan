@@ -1,3 +1,5 @@
+//! High-level UI flows that guide the user through mapping files and options.
+
 use anyhow::Result;
 use colored::*;
 use std::path::PathBuf;

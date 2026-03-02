@@ -1,3 +1,6 @@
+//! Binary entrypoint for the transfer-plan application. Sets up logging and
+//! delegates to `app::run`.
+
 mod app;
 mod config;
 mod queue;

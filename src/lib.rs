@@ -1,3 +1,6 @@
+//! Library root for the transfer-plan crate. Provides core modules used by
+//! both the binary and any potential downstream consumers.
+
 pub mod queue;
 pub mod transfer;
 pub mod worker;

@@ -1,3 +1,6 @@
+//! Disk space reservation and checking utilities used to avoid running out of
+//! space mid-transfer.
+
 use crate::transfer::format_size;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};

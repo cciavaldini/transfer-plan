@@ -1,3 +1,6 @@
+//! Helpers for detecting and handling processes keeping a mount point busy.
+//! Uses `/proc` rather than external `fuser`/`ps`.
+
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;

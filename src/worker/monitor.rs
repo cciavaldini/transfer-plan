@@ -1,3 +1,6 @@
+//! Background task that watches queue and statistics to update overall progress
+//! bar.
+
 use crate::queue::{QueueCommand, TransferQueue};
 use crate::transfer::format_size;
 use indicatif::ProgressBar;

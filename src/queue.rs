@@ -1,3 +1,6 @@
+//! Thread-safe queue implementation for managing transfer items and control
+//! commands. Supports checkpointing and snapshotting.
+
 use anyhow::{Context, Result};
 use crossbeam::channel::{self, Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;

@@ -1,3 +1,5 @@
+//! Core worker loop and error handling for individual transfer threads.
+
 use crate::queue::{QueueCommand, TransferQueue};
 use crate::transfer::copy_file_optimized;
 use colored::Colorize;

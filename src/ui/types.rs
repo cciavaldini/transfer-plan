@@ -1,3 +1,5 @@
+//! Simple data types used by the UI, such as `TransferMapping`.
+
 use std::path::PathBuf;
 
 #[derive(Clone)]

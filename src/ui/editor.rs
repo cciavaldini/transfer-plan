@@ -1,3 +1,5 @@
+//! Path-editing helper using `rustyline` for command-line user input.
+
 use rustyline::completion::FilenameCompleter;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Config, Editor, EditMode};

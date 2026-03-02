@@ -1,3 +1,5 @@
+//! Interactive prompt helpers for gathering transfer configuration from user.
+
 use anyhow::Result;
 use colored::*;
 use rustyline::error::ReadlineError;

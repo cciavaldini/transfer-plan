@@ -1,3 +1,5 @@
+//! Worker-related submodules and re-exports used by `app` to start transfers.
+
 mod cleanup;
 mod monitor;
 mod pool;

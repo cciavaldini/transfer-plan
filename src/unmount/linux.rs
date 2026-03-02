@@ -1,3 +1,6 @@
+//! Linux-specific implementation for safe unmounting of drives, including
+//! busy-process handling and fallbacks.
+
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

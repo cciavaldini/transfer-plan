@@ -1,3 +1,6 @@
+//! Miscellaneous helper functions for buffer management, atomic arithmetic,
+//! and temporary file handling used by the transfer module.
+
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashSet;

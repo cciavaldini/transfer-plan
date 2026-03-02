@@ -1,3 +1,5 @@
+//! Cleanup helpers run after each successful file transfer.
+
 use colored::Colorize;
 use indicatif::ProgressBar;
 use std::cmp::Reverse;

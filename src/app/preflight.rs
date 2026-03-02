@@ -1,3 +1,5 @@
+//! Preflight validation routines executed before beginning transfers.
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashMap;

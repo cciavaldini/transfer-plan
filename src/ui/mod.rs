@@ -1,3 +1,5 @@
+//! Public UI utilities that combine lower-level modules for use by `app`.
+
 pub mod banner;
 pub mod editor;
 pub mod printing;

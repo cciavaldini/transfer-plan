@@ -1,3 +1,6 @@
+//! Shared types used across worker modules, such as transfer statistics and
+//! context structs.
+
 use crate::queue::TransferQueue;
 use indicatif::{MultiProgress, ProgressBar};
 use std::collections::{HashMap, HashSet};

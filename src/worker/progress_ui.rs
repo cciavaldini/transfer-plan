@@ -1,3 +1,5 @@
+//! UI helpers for per-file progress bars and formatting.
+
 use indicatif::ProgressStyle;
 use once_cell::sync::Lazy;
 

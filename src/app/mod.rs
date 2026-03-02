@@ -1,3 +1,6 @@
+//! Top-level application logic orchestrating configuration, queue setup, and
+//! transfer batches.
+
 mod checkpoint;
 mod mounts;
 mod preflight;

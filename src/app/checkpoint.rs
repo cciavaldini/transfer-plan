@@ -1,3 +1,5 @@
+//! Logic for saving and restoring queue checkpoints between runs.
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};

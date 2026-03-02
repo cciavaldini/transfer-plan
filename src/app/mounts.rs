@@ -1,3 +1,5 @@
+//! Utilities for detecting mounted drives and deriving USB speeds.
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use procfs::process::Process;

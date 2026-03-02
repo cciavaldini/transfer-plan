@@ -15,6 +15,9 @@ use crate::transfer::progress::{ProgressReader, finish_with_overall_sync};
 use crate::transfer::verify::{verify_transfer};
 use crate::transfer::{SMALL_BUFFER, MEDIUM_BUFFER, LARGE_BUFFER, XLARGE_BUFFER};
 
+/// Pick a read/write buffer capacity based on total file size.
+/// Small files use a modest buffer to avoid wasting memory, while very large
+/// transfers benefit from a larger I/O window.
 fn optimal_buffer_size(file_size: u64) -> usize {
     match file_size {
         0..=1_048_576 => SMALL_BUFFER,
@@ -24,6 +27,12 @@ fn optimal_buffer_size(file_size: u64) -> usize {
     }
 }
 
+/// Perform a conventional I/O-based copy from `source` to `destination`.
+///
+/// The operation writes to a temporary file before atomically renaming. A
+/// `ProgressReader` wraps the source reader to periodically update the
+/// supplied progress bars and maintain an atomic count of bytes copied. After
+/// completion the write buffers are flushed and the temporary file finalized.
 fn copy_file_iocopy(
     source: &Path,
     destination: &Path,
@@ -68,6 +77,12 @@ fn copy_file_iocopy(
     Ok(())
 }
 
+/// Use the Linux `copy_file_range` syscall (via nix) to perform a kernel-
+/// assisted zero-copy transfer. Falls back to `ZERO_COPY_UNAVAILABLE` if the
+/// syscall is unsupported or fails with certain errno codes.
+///
+/// Progress bars and byte counters are updated for each chunk successfully
+/// transferred. The same atomic rename pattern is used as in the iocopy path.
 fn copy_file_copy_file_range(
     source: &Path,
     destination: &Path,
@@ -132,6 +147,10 @@ enum AttemptOutcome {
     Retry(Option<anyhow::Error>),
 }
 
+/// Perform a single attempt to transfer the file, choosing between the
+/// optimized `copy_file_range` path and conventional I/O. The caller supplies
+/// a mutable flag `use_copy_file_range` which is toggled off if zero-copy turns
+/// out to be unavailable, ensuring subsequent retries fall back automatically.
 fn copy_attempt(
     source: &Path,
     destination: &Path,
@@ -177,6 +196,10 @@ fn copy_attempt(
     }
 }
 
+/// After a copy attempt, optionally verify the transfer by checksum. If
+/// verification fails the progress bars are rolled back and either an error or
+/// a retry indication is returned. The caller is responsible for backoff and
+/// stopping after `MAX_RETRIES`.
 fn verify_attempt(
     source: &Path,
     destination: &Path,
@@ -216,6 +239,17 @@ fn apply_retry_backoff(progress: &ProgressBar, attempt: usize) {
     progress.reset();
 }
 
+/// High-level entry point for copying a single file with retries,
+/// verification, and progress reporting. It chooses the appropriate method
+/// (zero-copy vs normal) based on file size and fallback conditions, and
+/// applies exponential backoff between attempts.
+///
+/// Parameters:
+/// * `source`/`destination` - file paths
+/// * `file_size` - size of the file in bytes
+/// * `progress`/`overall_progress` - indicatif progress bars
+/// * `verify` - whether to checksum after each transfer
+/// * `copied_bytes` - atomic counter shared across files for global progress
 pub fn copy_file_optimized(
     source: &Path,
     destination: &Path,

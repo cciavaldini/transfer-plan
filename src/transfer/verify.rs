@@ -1,3 +1,6 @@
+//! File hashing and verification utilities used to compare source and
+//! destination files when `verify` mode is enabled.
+
 use anyhow::{Result, Context};
 use sha2::{Digest, Sha256};
 use std::io::{self, Read};
