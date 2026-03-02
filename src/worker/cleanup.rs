@@ -25,11 +25,15 @@ pub(crate) fn finish_successful_transfer(
                     guard.insert(root.to_path_buf());
                 }
                 if show_feedback {
-                    file_pb.finish_with_message(format!(
-                        "{}✓ {} (removed)",
-                        worker_prefix,
-                        file_name.green()
-                    ));
+                    // prefix already includes worker id and truncated file name;
+                    // the message only needs to show the status symbol and any
+                    // additional note so the name doesn’t appear twice.
+                    let msg = if cleanup_mode == "delete" {
+                        "✓ (removed)".to_string()
+                    } else {
+                        "✓ (complete)".to_string()
+                    };
+                    file_pb.finish_with_message(msg);
                 } else {
                     file_pb.finish();
                 }

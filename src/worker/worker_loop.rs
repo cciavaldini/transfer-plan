@@ -2,7 +2,6 @@
 
 use crate::queue::{QueueCommand, TransferQueue};
 use crate::transfer::copy_file_optimized;
-use colored::Colorize;
 use indicatif::ProgressBar;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,10 +45,10 @@ fn transfer_failure_stop(
     let _ = queue.get_sender().send(QueueCommand::Stop);
 
     if show_file_progress {
+        // prefix already contains worker id and file name; avoid repeating
+        // them in the message.
         file_pb.finish_with_message(format!(
-            "{}✗ {} - {}",
-            worker_prefix,
-            file_name.red(),
+            "✗ {}",
             reason
         ));
     } else {
@@ -190,9 +189,7 @@ pub(crate) fn transfer_worker_single(worker_id: usize, ctx: WorkerContext) {
                 stats.inc_failed();
                 if show_file_progress {
                     file_pb.finish_with_message(format!(
-                        "{}✗ {} - Error: {}",
-                        worker_prefix,
-                        file_name.red(),
+                        "✗ Error: {}",
                         e
                     ));
                 } else {
