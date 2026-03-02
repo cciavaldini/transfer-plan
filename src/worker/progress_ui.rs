@@ -9,7 +9,7 @@ pub(crate) static FILE_PROGRESS_STYLE: Lazy<ProgressStyle> = Lazy::new(|| {
         .template(
             "{prefix} [{bar:30.green/white}] {bytes}/{total_bytes} ({eta}) {binary_bytes_per_sec:.cyan} {msg}",
         )
-        .unwrap()
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("█▓▒░-")
 });
 

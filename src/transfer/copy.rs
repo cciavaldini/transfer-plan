@@ -137,7 +137,7 @@ fn copy_attempt(
     destination: &Path,
     file_size: u64,
     progress: &ProgressBar,
-    copied_bytes: &Arc<AtomicU64>,
+    copied_bytes: Arc<AtomicU64>,
     overall_progress: &ProgressBar,
     use_copy_file_range: &mut bool,
 ) -> Result<()> {
@@ -146,7 +146,7 @@ fn copy_attempt(
             source,
             destination,
             progress.clone(),
-            copied_bytes.clone(),
+            Arc::clone(&copied_bytes),
             overall_progress.clone(),
             file_size,
         ) {
@@ -158,7 +158,7 @@ fn copy_attempt(
                     source,
                     destination,
                     progress.clone(),
-                    copied_bytes.clone(),
+                    Arc::clone(&copied_bytes),
                     overall_progress.clone(),
                     file_size,
                 )
@@ -170,7 +170,7 @@ fn copy_attempt(
             source,
             destination,
             progress.clone(),
-            copied_bytes.clone(),
+            Arc::clone(&copied_bytes),
             overall_progress.clone(),
             file_size,
         )
@@ -184,7 +184,7 @@ fn verify_attempt(
     can_verify: bool,
     attempt: usize,
     progress: &ProgressBar,
-    copied_bytes: &Arc<AtomicU64>,
+    copied_bytes: Arc<AtomicU64>,
     overall_progress: &ProgressBar,
 ) -> Result<AttemptOutcome> {
     if !can_verify {
@@ -194,14 +194,14 @@ fn verify_attempt(
     match verify_transfer(source, destination, file_size) {
         Ok(true) => Ok(AttemptOutcome::Completed),
         Ok(false) => {
-            rollback_file_attempt_progress(progress, copied_bytes, overall_progress);
+            rollback_file_attempt_progress(progress, &copied_bytes, overall_progress);
             if attempt == MAX_RETRIES {
                 anyhow::bail!("Verification failed after {} attempts", MAX_RETRIES);
             }
             Ok(AttemptOutcome::Retry(None))
         }
         Err(e) => {
-            rollback_file_attempt_progress(progress, copied_bytes, overall_progress);
+            rollback_file_attempt_progress(progress, &copied_bytes, overall_progress);
             if attempt == MAX_RETRIES {
                 return Err(e);
             }
@@ -225,6 +225,13 @@ pub fn copy_file_optimized(
     copied_bytes: Arc<AtomicU64>,
     overall_progress: ProgressBar,
 ) -> Result<()> {
+    tracing::debug!(
+        source = %source.display(),
+        destination = %destination.display(),
+        file_size,
+        verify,
+        "Starting optimized file copy"
+    );
     let can_verify = verify && file_size <= crate::transfer::VERIFICATION_SIZE_LIMIT;
 
     let mut attempt = 0;
@@ -237,7 +244,7 @@ pub fn copy_file_optimized(
             destination,
             file_size,
             &progress,
-            &copied_bytes,
+            Arc::clone(&copied_bytes),
             &overall_progress,
             &mut use_copy_file_range,
         ) {
@@ -248,7 +255,7 @@ pub fn copy_file_optimized(
                 can_verify,
                 attempt,
                 &progress,
-                &copied_bytes,
+                Arc::clone(&copied_bytes),
                 &overall_progress,
             )? {
                 AttemptOutcome::Completed => return Ok(()),

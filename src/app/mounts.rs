@@ -354,7 +354,7 @@ pub(crate) fn watch_mounts_for_queueing(
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             let _ = tx.send(res);
         })
-        .expect("Failed to create watcher");
+        .expect("Failed to create file watcher for mount monitoring");
 
     for p in &watch_paths {
         let _ = notify::Watcher::watch(&mut watcher, p, notify::RecursiveMode::NonRecursive);

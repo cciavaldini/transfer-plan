@@ -72,6 +72,7 @@ fn destination_is_unchanged(source_meta: &fs::Metadata, destination: &Path) -> b
 }
 
 impl TransferQueue {
+    /// Create a new transfer queue for staging files before parallel processing.
     pub fn new() -> Self {
         let (items_tx, items_rx) = channel::unbounded();
         let (cmd_tx, cmd_rx) = channel::unbounded();
@@ -87,6 +88,7 @@ impl TransferQueue {
         }
     }
 
+    /// Get a sender channel for external commands to control the queue.
     pub fn get_sender(&self) -> Sender<QueueCommand> {
         self.cmd_tx.clone()
     }
@@ -118,6 +120,9 @@ impl TransferQueue {
         Ok(())
     }
 
+    /// Add a single file to the queue, respecting the update mode policy.
+    ///
+    /// Returns summary info about what was queued (skip/update/new).
     pub fn add_file_with_policy(
         &self,
         source: PathBuf,
@@ -202,6 +207,7 @@ impl TransferQueue {
     }
 
     /// Snapshot current pending items in queue order.
+    /// Get a snapshot of all currently queued items (immutable copy).
     pub fn snapshot_items(&self) -> Vec<TransferItem> {
         self.snapshot_items.lock().iter().cloned().collect()
     }
@@ -246,6 +252,7 @@ impl TransferQueue {
     }
 
     #[inline]
+    /// Total number of items in the queue.
     pub fn len(&self) -> usize {
         self.pending_items.load(Ordering::Acquire)
     }
@@ -256,6 +263,7 @@ impl TransferQueue {
     }
 
     #[inline]
+    /// Total cumulative size of all queued items in bytes.
     pub fn total_size(&self) -> u64 {
         // O(1) instead of O(n) - cached!
         self.total_size.load(Ordering::Relaxed)
@@ -270,5 +278,40 @@ impl TransferQueue {
 impl Default for TransferQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_queue_creation() {
+        let queue = TransferQueue::new();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.total_size(), 0);
+    }
+
+    #[test]
+    fn test_queue_default() {
+        let queue = TransferQueue::default();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_command_channel() {
+        let queue = TransferQueue::new();
+        let _sender = queue.get_sender();
+        // Verify we can get a sender for external command control
+        assert!(queue.try_recv_command().is_none());
+    }
+
+    #[test]
+    fn test_queue_snapshot() {
+        let queue = TransferQueue::new();
+        let snapshot = queue.snapshot_items();
+        assert!(snapshot.is_empty());
     }
 }

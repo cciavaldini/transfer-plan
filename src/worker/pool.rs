@@ -24,6 +24,13 @@ pub async fn transfer_worker_pool(
     verify: bool,
     cleanup_mode: String,
 ) -> Result<TransferOutcome> {
+    tracing::info!(
+        num_workers,
+        verify,
+        cleanup_mode = %cleanup_mode,
+        queue_size = queue.len(),
+        "Starting transfer worker pool"
+    );
     let cleanup_delete_mode = cleanup_mode == "delete";
     let stats = Arc::new(TransferStats::new());
     let io_bytes = Arc::new(AtomicU64::new(0));
@@ -36,7 +43,7 @@ pub async fn transfer_worker_pool(
     overall_pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")
-            .unwrap()
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-"),
     );
 
